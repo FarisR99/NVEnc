@@ -34,8 +34,13 @@
 
 #if ENABLE_LIBPLACEBO
 
+// Library names and the pl_log_create_<ver> symbol carry the libplacebo API
+// version, so also try the version the headers we compiled against declare.
+#define RGY_PL_STR2(x) #x
+#define RGY_PL_STR(x) RGY_PL_STR2(x)
+
 #if defined(_WIN32) || defined(_WIN64)
-const TCHAR *RGY_LIBPLACEBO_DLL_NAME = _T("libplacebo-360.dll");
+const TCHAR *RGY_LIBPLACEBO_DLL_NAME = _T("libplacebo-" RGY_PL_STR(PL_API_VER) ".dll");
 #elif LIBPLACEBO_STATIC_LINK
 const TCHAR *RGY_LIBPLACEBO_DLL_NAME = _T("libplacebo (static)");
 #else
@@ -182,6 +187,7 @@ bool RGYLibplaceboLoader::load() {
 
 #if defined(_WIN32) || defined(_WIN64)
     const TCHAR *libraryNames[] = {
+        _T("libplacebo-" RGY_PL_STR(PL_API_VER) ".dll"),
 #if PL_API_VER >= 360
         _T("libplacebo-360.dll"),
 #endif
@@ -195,6 +201,7 @@ bool RGYLibplaceboLoader::load() {
     };
 #else
     const TCHAR *libraryNames[] = {
+        _T("libplacebo.so." RGY_PL_STR(PL_API_VER)),
 #if PL_API_VER >= 360
         _T("libplacebo.so.360"),
 #endif
@@ -209,6 +216,7 @@ bool RGYLibplaceboLoader::load() {
     };
 #endif
     const int apiVersions[] = {
+        PL_API_VER,
 #if PL_API_VER >= 360
         360,
 #endif
