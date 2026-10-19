@@ -30,6 +30,8 @@
 #define __NVENC_FILTER_D3D11_H__
 
 #include <array>
+#include <memory>
+#include <vector>
 #include "rgy_version.h"
 #include "convert_csp.h"
 
@@ -46,8 +48,13 @@ public:
     ~CUDADX11Texture();
     RGY_ERR create(DeviceDX11 *dx11, const int width, const int height, const DXGI_FORMAT format);
     RGY_ERR registerTexture();
-    RGY_ERR map();
-    RGY_ERR unmap();
+    RGY_ERR map(cudaStream_t stream = 0);
+    RGY_ERR unmap(cudaStream_t stream = 0);
+    // Map/unmap several textures with one call (one D3D11/CUDA sync instead of one per texture).
+    // Pass the stream that uses the mapped arrays: legacy stream 0 does not order against
+    // cudaStreamNonBlocking streams.
+    static RGY_ERR map(const std::vector<std::unique_ptr<CUDADX11Texture>>& textures, cudaStream_t stream);
+    static RGY_ERR unmap(const std::vector<std::unique_ptr<CUDADX11Texture>>& textures, cudaStream_t stream);
     cudaArray *getMappedArray();
     RGY_ERR unregisterTexture();
 

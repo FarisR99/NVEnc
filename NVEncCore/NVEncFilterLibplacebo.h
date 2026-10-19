@@ -242,6 +242,10 @@ protected:
 
     virtual RGY_ERR initLibplacebo(const NVEncFilterParam *param);
 
+#if ENABLE_D3D11
+    RGY_ERR wrapTextures(std::vector<std::unique_ptr<std::remove_pointer<pl_tex>::type, RGYLibplaceboTexDeleter>>& plTex, const std::vector<std::unique_ptr<CUDAInteropTexture>>& textures, const TCHAR *name);
+#endif
+
     virtual RGY_CSP getTextureCsp(const RGY_CSP csp);
 
     virtual CUDAInteropDataFormat getTextureDataFormat([[maybe_unused]] const RGY_CSP csp);
@@ -283,6 +287,15 @@ protected:
     std::vector<std::unique_ptr<CUDAInteropTexture>> m_textIn;
 
     std::vector<std::unique_ptr<CUDAInteropTexture>> m_textOut;
+
+#if ENABLE_D3D11
+
+    // m_textIn/m_textOutをpl_texとしてwrapしたもの (テクスチャ作成時に1回だけwrapする)
+    std::vector<std::unique_ptr<std::remove_pointer<pl_tex>::type, RGYLibplaceboTexDeleter>> m_plTexIn;
+
+    std::vector<std::unique_ptr<std::remove_pointer<pl_tex>::type, RGYLibplaceboTexDeleter>> m_plTexOut;
+
+#endif
 
 #if ENABLE_VULKAN
 

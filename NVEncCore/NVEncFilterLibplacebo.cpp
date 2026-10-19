@@ -79,6 +79,10 @@ NVEncFilterLibplacebo::NVEncFilterLibplacebo() :
     m_dither_state(std::unique_ptr<pl_shader_obj, decltype(&pl_shader_obj_destroy)>(nullptr, nullptr)),
     m_textIn(),
     m_textOut(),
+#if ENABLE_D3D11
+    m_plTexIn(),
+    m_plTexOut(),
+#endif
 #if ENABLE_VULKAN
     m_semInVKWait(),
     m_semInVKStart(),
@@ -290,6 +294,9 @@ RGY_ERR NVEncFilterLibplacebo::initCommon(shared_ptr<NVEncFilterParam> pParam) {
         }
     }
     if (textInReset) {
+#if ENABLE_D3D11
+        m_plTexIn.clear();
+#endif
         m_textIn.clear();
         for (int iplane = 0; iplane < numPlanes; iplane++) {
             const auto planeIn = getPlane(&textInFrameInfo, (RGY_PLANE)iplane);
@@ -323,6 +330,12 @@ RGY_ERR NVEncFilterLibplacebo::initCommon(shared_ptr<NVEncFilterParam> pParam) {
             m_semInVKStart.push_back(std::move(semStart));
 #endif
         }
+#if ENABLE_D3D11
+        sts = wrapTextures(m_plTexIn, m_textIn, _T("input"));
+        if (sts != RGY_ERR_NONE) {
+            return sts;
+        }
+#endif
     }
     bool textOutReset = (int)m_textOut.size() != numPlanes;
     if (!textOutReset) {
@@ -335,6 +348,9 @@ RGY_ERR NVEncFilterLibplacebo::initCommon(shared_ptr<NVEncFilterParam> pParam) {
         }
     }
     if (textOutReset) {
+#if ENABLE_D3D11
+        m_plTexOut.clear();
+#endif
         m_textOut.clear();
         for (int iplane = 0; iplane < numPlanes; iplane++) {
             const auto planeOut = getPlane(&pParam->frameOut, (RGY_PLANE)iplane);
@@ -368,6 +384,12 @@ RGY_ERR NVEncFilterLibplacebo::initCommon(shared_ptr<NVEncFilterParam> pParam) {
             m_semOutVKStart.push_back(std::move(semStart));
 #endif
         }
+#if ENABLE_D3D11
+        sts = wrapTextures(m_plTexOut, m_textOut, _T("output"));
+        if (sts != RGY_ERR_NONE) {
+            return sts;
+        }
+#endif
     }
 
     if (!m_dstCrop
@@ -441,6 +463,27 @@ RGY_ERR NVEncFilterLibplacebo::initCommon(shared_ptr<NVEncFilterParam> pParam) {
     return sts;
 }
 
+#if ENABLE_D3D11
+RGY_ERR NVEncFilterLibplacebo::wrapTextures(std::vector<std::unique_ptr<std::remove_pointer<pl_tex>::type, RGYLibplaceboTexDeleter>>& plTex, const std::vector<std::unique_ptr<CUDAInteropTexture>>& textures, const TCHAR *name) {
+    plTex.clear();
+    for (int iplane = 0; iplane < (int)textures.size(); iplane++) {
+        pl_tex_wrap_params tex_wrap = { 0 };
+        tex_wrap.tex = textures[iplane]->texture();
+        tex_wrap.fmt = textures[iplane]->getTextureDXGIFormat();
+        tex_wrap.w = textures[iplane]->width();
+        tex_wrap.h = textures[iplane]->height();
+        auto tex = std::unique_ptr<std::remove_pointer<pl_tex>::type, RGYLibplaceboTexDeleter>(
+            m_pl->p_tex_wrap()(m_pldevice->gpu, &tex_wrap), RGYLibplaceboTexDeleter(m_pl.get(), m_pldevice->gpu));
+        if (!tex) {
+            AddMessage(RGY_LOG_ERROR, _T("Failed to wrap %s %s plane(%d) to pl_tex.\n"), name, RGY_LIBPLACEBO_DEV_API, iplane);
+            return RGY_ERR_NULL_PTR;
+        }
+        plTex.push_back(std::move(tex));
+    }
+    return RGY_ERR_NONE;
+}
+#endif
+
 RGY_ERR NVEncFilterLibplacebo::run_filter(const RGYFrameInfo *pInputFrame, RGYFrameInfo **ppOutputFrames, int *pOutputFrameNum, cudaStream_t stream) {
     RGY_ERR sts = RGY_ERR_NONE;
     if (pInputFrame->ptr[0] == nullptr) {
@@ -490,30 +533,32 @@ RGY_ERR NVEncFilterLibplacebo::run_filter(const RGYFrameInfo *pInputFrame, RGYFr
 #endif
 #if 1
     std::vector<std::unique_ptr<std::remove_pointer<pl_tex>::type, RGYLibplaceboTexDeleter>> pl_tex_planes_in;
-    for (int iplane = 0; iplane < RGY_CSP_PLANES[txtFrameBufIn->csp]; iplane++) {
-        pl_tex_wrap_params tex_wrap_in = { 0 };
+    std::vector<pl_tex> texPlanesIn;
 #if ENABLE_D3D11
-        tex_wrap_in.tex = m_textIn[iplane]->texture();
-        tex_wrap_in.fmt = m_textIn[iplane]->getTextureDXGIFormat();
-        tex_wrap_in.w = m_textIn[iplane]->width();
-        tex_wrap_in.h = m_textIn[iplane]->height();
+    // 全planeを1回でmapし、streamに対して同期させる
+    // (stream 0ではcudaStreamNonBlockingのstreamとの順序が保証されない)
+    sts = CUDAInteropTexture::map(m_textIn, stream);
+    if (sts != RGY_ERR_NONE) {
+        AddMessage(RGY_LOG_ERROR, _T("Failed to map input textures: %s.\n"), get_err_mes(sts));
+        return sts;
+    }
+#endif
+    for (int iplane = 0; iplane < RGY_CSP_PLANES[txtFrameBufIn->csp]; iplane++) {
+#if ENABLE_D3D11
+        texPlanesIn.push_back(m_plTexIn[iplane].get());
 #elif ENABLE_VULKAN
+        pl_tex_wrap_params tex_wrap_in = { 0 };
         tex_wrap_in.image = m_textIn[iplane]->image();
         tex_wrap_in.format = m_textIn[iplane]->format();
         tex_wrap_in.usage = m_textIn[iplane]->usage();
         tex_wrap_in.width = m_textIn[iplane]->width();
         tex_wrap_in.height = m_textIn[iplane]->height();
-#endif
         auto pl_tex_in = std::unique_ptr<std::remove_pointer<pl_tex>::type, RGYLibplaceboTexDeleter>(
             m_pl->p_tex_wrap()(m_pldevice->gpu, &tex_wrap_in), RGYLibplaceboTexDeleter(m_pl.get(), m_pldevice->gpu));
         if (!pl_tex_in) {
             AddMessage(RGY_LOG_ERROR, _T("Failed to wrap input %s plane(%d) to pl_tex.\n"), RGY_LIBPLACEBO_DEV_API, iplane);
             return RGY_ERR_NULL_PTR;
         }
-#if ENABLE_D3D11
-        //mapで同期がかかる
-        m_textIn[iplane]->map();
-#elif ENABLE_VULKAN
         // pl_vulkan_wrap したものはhold状態なので、再度holdする必要はない
 #endif
         // ngxFrameBufIn -> m_textIn
@@ -529,9 +574,7 @@ RGY_ERR NVEncFilterLibplacebo::run_filter(const RGYFrameInfo *pInputFrame, RGYFr
                 return sts;
             }
         }
-#if ENABLE_D3D11
-        m_textIn[iplane]->unmap();
-#elif ENABLE_VULKAN
+#if ENABLE_VULKAN
         // semaphoreがsignal状態になったら、texのhold状態を解除して、vulkan(libplacebo)の処理を始める
         pl_vulkan_release_params release_params = { 0 };
         release_params.tex = pl_tex_in.get();
@@ -541,9 +584,17 @@ RGY_ERR NVEncFilterLibplacebo::run_filter(const RGYFrameInfo *pInputFrame, RGYFr
         // streamの処理(cudaMemcpy2DToArrayAsync)が終わったら、semaphoreをsignal状態にする
         // これにより、vulkan(libplacebo)の処理が始められる
         m_semInVKStart[iplane]->signal(stream);
-#endif
+        texPlanesIn.push_back(pl_tex_in.get());
         pl_tex_planes_in.push_back(std::move(pl_tex_in));
+#endif
     }
+#if ENABLE_D3D11
+    sts = CUDAInteropTexture::unmap(m_textIn, stream);
+    if (sts != RGY_ERR_NONE) {
+        AddMessage(RGY_LOG_ERROR, _T("Failed to unmap input textures: %s.\n"), get_err_mes(sts));
+        return sts;
+    }
+#endif
 
     if (!ppOutputFrames[0]) {
         ppOutputFrames[0] = &m_frameBuf[0]->frame;
@@ -552,38 +603,35 @@ RGY_ERR NVEncFilterLibplacebo::run_filter(const RGYFrameInfo *pInputFrame, RGYFr
 
     // フィルタを適用
     std::vector<std::unique_ptr<std::remove_pointer<pl_tex>::type, RGYLibplaceboTexDeleter>> pl_tex_planes_out;
+    std::vector<pl_tex> texPlanesOut;
     for (int iplane = 0; iplane < (int)m_textIn.size(); iplane++) {
-        pl_tex_wrap_params tex_wrap_out = { 0 };
 #if ENABLE_D3D11
-        tex_wrap_out.tex = m_textOut[iplane]->texture();
-        tex_wrap_out.fmt = m_textOut[iplane]->getTextureDXGIFormat();
-        tex_wrap_out.w = m_textOut[iplane]->width();
-        tex_wrap_out.h = m_textOut[iplane]->height();
+        texPlanesOut.push_back(m_plTexOut[iplane].get());
 #elif ENABLE_VULKAN
+        pl_tex_wrap_params tex_wrap_out = { 0 };
         tex_wrap_out.image = m_textOut[iplane]->image();
         tex_wrap_out.format = m_textOut[iplane]->format();
         tex_wrap_out.usage = m_textOut[iplane]->usage();
         tex_wrap_out.width = m_textOut[iplane]->width();
         tex_wrap_out.height = m_textOut[iplane]->height();
-#endif
         auto pl_tex_out = std::unique_ptr<std::remove_pointer<pl_tex>::type, RGYLibplaceboTexDeleter>(
             m_pl->p_tex_wrap()(m_pldevice->gpu, &tex_wrap_out), RGYLibplaceboTexDeleter(m_pl.get(), m_pldevice->gpu));
         if (!pl_tex_out) {
             AddMessage(RGY_LOG_ERROR, _T("Failed to wrap output %s plane(%d) to pl_tex.\n"), RGY_LIBPLACEBO_DEV_API, iplane);
             return RGY_ERR_NULL_PTR;
         }
-#if ENABLE_VULKAN
         // pl_tex_wrapしたものはhold状態なのでいったん開放する
         pl_vulkan_release_params release_params = { 0 };
         release_params.tex = pl_tex_out.get();
         m_pl->p_vulkan_release_ex()(m_pldevice->gpu, &release_params);
-#endif
+        texPlanesOut.push_back(pl_tex_out.get());
         pl_tex_planes_out.push_back(std::move(pl_tex_out));
+#endif
         if (!m_procByFrame) {
             const RGY_PLANE planeIdx = (RGY_PLANE)iplane;
             auto planeIn = getPlane(pInputFrame, planeIdx);
             auto planeOut = getPlane(ppOutputFrames[0], planeIdx);
-            sts = procPlane(pl_tex_planes_out[iplane].get(), &planeOut, pl_tex_planes_in[iplane].get(), &planeIn, planeIdx);
+            sts = procPlane(texPlanesOut[iplane], &planeOut, texPlanesIn[iplane], &planeIn, planeIdx);
             if (sts != RGY_ERR_NONE) {
                 AddMessage(RGY_LOG_ERROR, _T("Failed to process plane(%d): %s.\n"), iplane, get_err_mes(sts));
                 return sts;
@@ -593,8 +641,8 @@ RGY_ERR NVEncFilterLibplacebo::run_filter(const RGYFrameInfo *pInputFrame, RGYFr
     if (m_procByFrame) {
         pl_tex texOut[RGY_MAX_PLANES], texIn[RGY_MAX_PLANES];
         for (int iplane = 0; iplane < (int)m_textIn.size(); iplane++) {
-            texOut[iplane] = pl_tex_planes_out[iplane].get();
-            texIn[iplane] = pl_tex_planes_in[iplane].get();
+            texOut[iplane] = texPlanesOut[iplane];
+            texIn[iplane] = texPlanesIn[iplane];
         }
         sts = procFrame(texOut, ppOutputFrames[0], texIn, txtFrameBufIn);
         if (sts != RGY_ERR_NONE) {
@@ -609,11 +657,16 @@ RGY_ERR NVEncFilterLibplacebo::run_filter(const RGYFrameInfo *pInputFrame, RGYFr
         AddMessage(RGY_LOG_ERROR, _T("unsupported csp, txtFrameBufOut and m_textOut plane count mismatch.\n"));
         return RGY_ERR_UNSUPPORTED;
     }
-    for (int iplane = 0; iplane < RGY_CSP_PLANES[txtFrameBufOut->csp]; iplane++) {
 #if ENABLE_D3D11
-        //mapで同期がかかる
-        m_textOut[iplane]->map();
-#elif ENABLE_VULKAN
+    //mapで同期がかかる (全planeを1回で、streamに対して)
+    sts = CUDAInteropTexture::map(m_textOut, stream);
+    if (sts != RGY_ERR_NONE) {
+        AddMessage(RGY_LOG_ERROR, _T("Failed to map output textures: %s.\n"), get_err_mes(sts));
+        return sts;
+    }
+#endif
+    for (int iplane = 0; iplane < RGY_CSP_PLANES[txtFrameBufOut->csp]; iplane++) {
+#if ENABLE_VULKAN
         // semaphoreがsignal状態になるまで、streamがvulkan関連の動作終了を待つ
         m_semOutVKWait[iplane]->wait(stream);
         // vulkan関連の処理が終わったら、semaphoreをsignal状態にする
@@ -639,9 +692,7 @@ RGY_ERR NVEncFilterLibplacebo::run_filter(const RGYFrameInfo *pInputFrame, RGYFr
                 return sts;
             }
         }
-#if ENABLE_D3D11
-        m_textOut[iplane]->unmap();
-#elif ENABLE_VULKAN
+#if ENABLE_VULKAN
         // semaphoreがsignal状態になったら、texのhold状態を解除して、vulkan(libplacebo)の処理を始める
         pl_vulkan_release_params release_params = { 0 };
         release_params.tex = pl_tex_planes_out[iplane].get();
@@ -652,6 +703,13 @@ RGY_ERR NVEncFilterLibplacebo::run_filter(const RGYFrameInfo *pInputFrame, RGYFr
         m_semOutVKStart[iplane]->signal(stream);
 #endif
     }
+#if ENABLE_D3D11
+    sts = CUDAInteropTexture::unmap(m_textOut, stream);
+    if (sts != RGY_ERR_NONE) {
+        AddMessage(RGY_LOG_ERROR, _T("Failed to unmap output textures: %s.\n"), get_err_mes(sts));
+        return sts;
+    }
+#endif
     pl_tex_planes_out.clear();
 #else // for debug
     // cudaMemcpy2DAsyncでngxFrameBufInからm_ngxFrameBufOutにコピーする
@@ -690,6 +748,10 @@ RGY_ERR NVEncFilterLibplacebo::run_filter(const RGYFrameInfo *pInputFrame, RGYFr
 }
 
 void NVEncFilterLibplacebo::close() {
+#if ENABLE_D3D11
+    m_plTexIn.clear();
+    m_plTexOut.clear();
+#endif
     m_textIn.clear();
     m_textOut.clear();
     m_textFrameBufOut.reset();

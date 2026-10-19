@@ -91,21 +91,44 @@ RGY_ERR CUDADX11Texture::registerTexture() {
     return RGY_ERR_NONE;
 }
 
-RGY_ERR CUDADX11Texture::map() {
-    auto sts = err_to_rgy(cudaGraphicsMapResources(1, &m_cudaResource, 0));
+RGY_ERR CUDADX11Texture::map(cudaStream_t stream) {
+    auto sts = err_to_rgy(cudaGraphicsMapResources(1, &m_cudaResource, stream));
     if (sts != RGY_ERR_NONE) {
         return sts;
     }
     return RGY_ERR_NONE;
 }
 
-RGY_ERR CUDADX11Texture::unmap() {
+RGY_ERR CUDADX11Texture::unmap(cudaStream_t stream) {
     auto sts = RGY_ERR_NONE;
     if (m_cuArray) {
-        sts = err_to_rgy(cudaGraphicsUnmapResources(1, &m_cudaResource, 0));
+        sts = err_to_rgy(cudaGraphicsUnmapResources(1, &m_cudaResource, stream));
         m_cuArray = nullptr;
     }
     return sts;
+}
+
+RGY_ERR CUDADX11Texture::map(const std::vector<std::unique_ptr<CUDADX11Texture>>& textures, cudaStream_t stream) {
+    std::vector<cudaGraphicsResource *> resources;
+    for (auto& txt : textures) {
+        resources.push_back(txt->m_cudaResource);
+    }
+    if (resources.empty()) {
+        return RGY_ERR_NONE;
+    }
+    return err_to_rgy(cudaGraphicsMapResources((int)resources.size(), resources.data(), stream));
+}
+
+RGY_ERR CUDADX11Texture::unmap(const std::vector<std::unique_ptr<CUDADX11Texture>>& textures, cudaStream_t stream) {
+    std::vector<cudaGraphicsResource *> resources;
+    for (auto& txt : textures) {
+        resources.push_back(txt->m_cudaResource);
+        txt->m_cuArray = nullptr;
+    }
+    if (resources.empty()) {
+        return RGY_ERR_NONE;
+    }
+    return err_to_rgy(cudaGraphicsUnmapResources((int)resources.size(), resources.data(), stream));
 }
 
 cudaArray *CUDADX11Texture::getMappedArray() {
