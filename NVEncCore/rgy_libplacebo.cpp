@@ -75,6 +75,13 @@ RGYLibplaceboLoader::RGYLibplaceboLoader() :
     m_pl_tex_destroy(nullptr),
     m_pl_tex_recreate(nullptr),
     m_pl_gpu_finish(nullptr),
+#if PL_API_VER >= 351
+    m_pl_cache_create(nullptr),
+    m_pl_cache_destroy(nullptr),
+    m_pl_cache_get_file(nullptr),
+    m_pl_cache_set_file(nullptr),
+    m_pl_gpu_set_cache(nullptr),
+#endif
     m_pl_log_create(nullptr),
     m_pl_log_destroy(nullptr),
     m_pl_dispatch_create(nullptr),
@@ -144,6 +151,13 @@ bool RGYLibplaceboLoader::load() {
     m_pl_tex_destroy = &pl_tex_destroy;
     m_pl_tex_recreate = &pl_tex_recreate;
     m_pl_gpu_finish = &pl_gpu_finish;
+#if PL_API_VER >= 351
+    m_pl_cache_create = &pl_cache_create;
+    m_pl_cache_destroy = &pl_cache_destroy;
+    m_pl_cache_get_file = &pl_cache_get_file;
+    m_pl_cache_set_file = &pl_cache_set_file;
+    m_pl_gpu_set_cache = &pl_gpu_set_cache;
+#endif
     m_pl_log_create = &pl_log_create;
     m_pl_log_destroy = &pl_log_destroy;
     m_pl_dispatch_create = &pl_dispatch_create;
@@ -278,6 +292,21 @@ bool RGYLibplaceboLoader::load() {
     if (!loadFunc("pl_tex_recreate", (void**)&m_pl_tex_recreate)) { close(); return false; }
 
     if (!loadFunc("pl_gpu_finish", (void**)&m_pl_gpu_finish)) { close(); return false; }
+#if PL_API_VER >= 351
+    // Optional: older libplacebo simply runs without a shader cache
+    if (m_apiVersion < 351
+        || !loadFunc("pl_cache_create", (void**)&m_pl_cache_create)
+        || !loadFunc("pl_cache_destroy", (void**)&m_pl_cache_destroy)
+        || !loadFunc("pl_cache_get_file", (void**)&m_pl_cache_get_file)
+        || !loadFunc("pl_cache_set_file", (void**)&m_pl_cache_set_file)
+        || !loadFunc("pl_gpu_set_cache", (void**)&m_pl_gpu_set_cache)) {
+        m_pl_cache_create = nullptr;
+        m_pl_cache_destroy = nullptr;
+        m_pl_cache_get_file = nullptr;
+        m_pl_cache_set_file = nullptr;
+        m_pl_gpu_set_cache = nullptr;
+    }
+#endif
 
     if (!loadFunc("pl_log_destroy", (void**)&m_pl_log_destroy)) { close(); return false; }
 

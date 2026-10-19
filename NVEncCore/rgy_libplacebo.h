@@ -90,6 +90,14 @@ private:
     decltype(&pl_tex_recreate) m_pl_tex_recreate;
 
     decltype(&pl_gpu_finish) m_pl_gpu_finish;
+#if PL_API_VER >= 351
+    // Optional (libplacebo API >= 351): the persistent shader cache
+    decltype(&pl_cache_create) m_pl_cache_create;
+    decltype(&pl_cache_destroy) m_pl_cache_destroy;
+    decltype(&pl_cache_get_file) m_pl_cache_get_file;
+    decltype(&pl_cache_set_file) m_pl_cache_set_file;
+    decltype(&pl_gpu_set_cache) m_pl_gpu_set_cache;
+#endif
 
     decltype(&pl_log_create) m_pl_log_create;
     decltype(&pl_log_destroy) m_pl_log_destroy;
@@ -165,6 +173,13 @@ public:
     auto p_tex_destroy() const { return m_pl_tex_destroy; }
     auto p_tex_recreate() const { return m_pl_tex_recreate; }
     auto p_gpu_finish() const { return m_pl_gpu_finish; }
+#if PL_API_VER >= 351
+    auto p_cache_create() const { return m_pl_cache_create; }
+    auto p_cache_destroy() const { return m_pl_cache_destroy; }
+    auto p_cache_get_file() const { return m_pl_cache_get_file; }
+    auto p_cache_set_file() const { return m_pl_cache_set_file; }
+    auto p_gpu_set_cache() const { return m_pl_gpu_set_cache; }
+#endif
     auto p_log_create() const { return m_pl_log_create; }
     auto p_log_destroy() const { return m_pl_log_destroy; }
     auto p_dispatch_create() const { return m_pl_dispatch_create; }

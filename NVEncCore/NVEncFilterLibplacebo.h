@@ -280,6 +280,14 @@ protected:
 
     std::unique_ptr<pl_shader_obj, decltype(&pl_shader_obj_destroy)> m_dither_state;
 
+#if PL_API_VER >= 351
+
+    pl_cache m_cache;
+
+    std::string m_cacheDir; // m_cacheが参照するので、m_cacheより長く保持する
+
+#endif
+
 
 
     std::unique_ptr<CUFrameBuf> m_textFrameBufOut;

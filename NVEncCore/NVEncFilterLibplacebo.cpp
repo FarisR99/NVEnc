@@ -68,6 +68,37 @@ static_assert(RGY_VK_API_VER >= PL_VK_MIN_VERSION, "RGY_VK_API_VER >= PL_VK_MIN_
 
 #include "rgy_device.h"
 
+#if PL_API_VER >= 351
+// libplaceboのシェーダキャッシュの保存先 (末尾は区切り文字、libplaceboはここにキーを付け足す)
+// libplaceboはfopenで開くので、ANSIのgetenvで取得する
+static std::string libplaceboShaderCacheDir() {
+#if defined(_WIN32) || defined(_WIN64)
+    const char *base = getenv("LOCALAPPDATA");
+    if (!base || !base[0]) {
+        return "";
+    }
+    std::string dir = std::string(base) + "\\NVEncC\\libplacebo_cache";
+    const char *sep = "\\";
+#else
+    std::string dir;
+    const char *xdg = getenv("XDG_CACHE_HOME");
+    const char *home = getenv("HOME");
+    if (xdg && xdg[0]) {
+        dir = std::string(xdg) + "/nvencc/libplacebo_cache";
+    } else if (home && home[0]) {
+        dir = std::string(home) + "/.cache/nvencc/libplacebo_cache";
+    } else {
+        return "";
+    }
+    const char *sep = "/";
+#endif
+    if (!CreateDirectoryRecursive(dir.c_str())) {
+        return "";
+    }
+    return dir + sep;
+}
+#endif
+
 NVEncFilterLibplacebo::NVEncFilterLibplacebo() :
     m_procByFrame(false),
     m_textCspIn(RGY_CSP_NA),
@@ -77,6 +108,10 @@ NVEncFilterLibplacebo::NVEncFilterLibplacebo() :
     m_dispatch(),
     m_renderer(),
     m_dither_state(std::unique_ptr<pl_shader_obj, decltype(&pl_shader_obj_destroy)>(nullptr, nullptr)),
+#if PL_API_VER >= 351
+    m_cache(nullptr),
+    m_cacheDir(),
+#endif
     m_textIn(),
     m_textOut(),
 #if ENABLE_D3D11
@@ -157,6 +192,23 @@ RGY_ERR NVEncFilterLibplacebo::initLibplacebo(const NVEncFilterParam *param) {
         return RGY_ERR_UNKNOWN;
     }
     AddMessage(RGY_LOG_DEBUG, _T("Created libplacebo %s device.\n"), RGY_LIBPLACEBO_DEV_API);
+
+#if PL_API_VER >= 351
+    // 永続シェーダキャッシュ: 2回目以降の起動でシェーダのコンパイルを省略する
+    if (!m_cache && m_pl->p_cache_create()) {
+        m_cacheDir = libplaceboShaderCacheDir();
+        if (m_cacheDir.length() > 0) {
+            pl_cache_params cache_params = {};
+            cache_params.log = m_log.get();
+            cache_params.get = m_pl->p_cache_get_file();
+            cache_params.set = m_pl->p_cache_set_file();
+            cache_params.priv = (void *)m_cacheDir.c_str();
+            m_cache = m_pl->p_cache_create()(&cache_params);
+            m_pl->p_gpu_set_cache()(m_pldevice->gpu, m_cache);
+            AddMessage(RGY_LOG_DEBUG, _T("libplacebo shader cache: %s\n"), char_to_tstring(m_cacheDir).c_str());
+        }
+    }
+#endif
 
     m_dispatch = std::unique_ptr<std::remove_pointer<pl_dispatch>::type, RGYLibplaceboDeleter<pl_dispatch>>(
         m_pl->p_dispatch_create()(m_log.get(), m_pldevice->gpu), RGYLibplaceboDeleter<pl_dispatch>(m_pl->p_dispatch_destroy()));
@@ -766,6 +818,13 @@ void NVEncFilterLibplacebo::close() {
     m_dither_state.reset();
     m_renderer.reset();
     m_dispatch.reset();
+#if PL_API_VER >= 351
+    if (m_cache) {
+        m_pl->p_gpu_set_cache()(m_pldevice->gpu, nullptr);
+        m_pl->p_cache_destroy()(&m_cache);
+        m_cache = nullptr;
+    }
+#endif
     m_pldevice.reset();
     m_log.reset();
     m_pl.reset();
