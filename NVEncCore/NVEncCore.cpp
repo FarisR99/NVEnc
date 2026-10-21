@@ -763,7 +763,16 @@ RGY_ERR NVEncCore::InitInput(InEncodeVideoParam *inputParam, DeviceCodecCsp& HWD
         return RGY_ERR_INVALID_PARAM;
     }
 
-    m_hdrseiOut = createHEVCHDRSei(inputParam->common.maxCll, inputParam->common.masterDisplay, inputParam->common.atcSei, m_pFileReader.get());
+    auto maxCll = inputParam->common.maxCll;
+    auto masterDisplay = inputParam->common.masterDisplay;
+    if (inputParam->vppnv.ngxTrueHDR.enable) {
+        // MediaStack: HDR10 metadata for TrueHDR's output unless the user set it:
+        // BT.2020 primaries, D65, peak = maxluminance.
+        const int peak = (int)inputParam->vppnv.ngxTrueHDR.maxLuminance;
+        if (maxCll.empty()) maxCll = strsprintf("%d,0", peak);
+        if (masterDisplay.empty()) masterDisplay = strsprintf("G(8500,39850)B(6550,2300)R(35400,14600)WP(15635,16450)L(%d,1)", peak * 10000);
+    }
+    m_hdrseiOut = createHEVCHDRSei(maxCll, masterDisplay, inputParam->common.atcSei, m_pFileReader.get());
     if (!m_hdrseiOut) {
         PrintMes(RGY_LOG_ERROR, _T("Failed to parse HEVC HDR10 metadata.\n"));
         return RGY_ERR_INVALID_PARAM;
@@ -3105,11 +3114,15 @@ std::vector<VppType> NVEncCore::InitFiltersCreateVppList(const InEncodeVideoPara
     if (inputParam->vpp.libplacebo_deband.enable)     filterPipeline.push_back(VppType::CL_LIBPLACEBO_DEBAND);
     if (inputParam->vpp.pad.enable)        filterPipeline.push_back(VppType::CL_PAD);
     if (inputParam->vpp.overlay.size() > 0)  filterPipeline.push_back(VppType::CL_OVERLAY);
+    // MediaStack: FRUC works in 8 bits, so interpolate the SDR frames before
+    // TrueHDR rather than its 10-bit HDR output.
+    const bool frucBeforeTrueHDR = inputParam->vpp.fruc.enable && inputParam->vppnv.ngxTrueHDR.enable;
+    if (frucBeforeTrueHDR)                    filterPipeline.push_back(VppType::CL_FRUC);
     if (inputParam->vppnv.ngxTrueHDR.enable)     filterPipeline.push_back(VppType::NGX_TRUEHDR);
     if (inputParam->vpp.onnx.enable)       filterPipeline.push_back(VppType::CL_ONNX);
     if (inputParam->vpp.rife_ov.enable)    filterPipeline.push_back(VppType::CL_RIFE_OV);
     if (inputParam->vpp.anime4k.enable)     filterPipeline.push_back(VppType::CL_ANIME4K);
-    if (inputParam->vpp.fruc.enable)     filterPipeline.push_back(VppType::CL_FRUC);
+    if (inputParam->vpp.fruc.enable && !frucBeforeTrueHDR) filterPipeline.push_back(VppType::CL_FRUC);
     if (inputParam->vppnv.nvvfxFrameGen.enable) filterPipeline.push_back(VppType::NVVFX_FRAME_GENERATION);
 
     if (filterPipeline.size() == 0) {
@@ -3504,6 +3517,12 @@ RGY_ERR NVEncCore::InitFilters(const InEncodeVideoParam *inputParam) {
         VuiFiltered.colorprim = RGY_PRIM_BT709;
         VuiFiltered.transfer = RGY_TRANSFER_IEC61966_2_1;
         VuiFiltered.colorrange = RGY_COLORRANGE_FULL;
+    }
+    if (inputParam->vppnv.ngxTrueHDR.enable) {
+        // MediaStack: tag TrueHDR's BT.2020 PQ output unless the user set it.
+        if (m_encVUI.matrix == RGY_MATRIX_UNSPECIFIED) m_encVUI.matrix = RGY_MATRIX_AUTO;
+        if (m_encVUI.colorprim == RGY_PRIM_UNSPECIFIED) m_encVUI.colorprim = RGY_PRIM_AUTO;
+        if (m_encVUI.transfer == RGY_TRANSFER_UNSPECIFIED) m_encVUI.transfer = RGY_TRANSFER_AUTO;
     }
     m_encVUI.apply_auto(VuiFiltered, m_uEncHeight);
     return RGY_ERR_NONE;

@@ -4193,7 +4193,9 @@ Overlay image on top of base video.
 
 ### --vpp-ngx-truehdr [&lt;param1&gt;=&lt;value1&gt;][,&lt;param2&gt;=&lt;value2&gt;],...  
 AI enhanced SDR to HDR conversion using RTX Video SDK. Output will be converted to colormatrix bt.2020.
-Adding ```--colormatrix bt2020nc --colorprim bt2020 --transfer smpte2084``` is recommended.
+The output is tagged bt2020nc / bt2020 / smpte2084, and HDR10 metadata is written (mastering display: bt.2020 primaries, D65, peak = ```maxluminance```; MaxCLL = ```maxluminance```), unless ```--colormatrix```, ```--colorprim```, ```--transfer```, ```--max-cll``` or ```--master-display``` set them. (MediaStack fork)
+
+When used with [--vpp-fruc](#--vpp-fruc-param1value1param2value2), frame interpolation runs before TrueHDR, since FRUC works in 8 bits. (MediaStack fork)
 
 Requires Turing GPUs or later, and requires driver version 550.58 or higher. Supported on Windows system only.
 
