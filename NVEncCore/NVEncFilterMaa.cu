@@ -43,6 +43,7 @@ static const int MAA_BLOCK_Y = 8;
 // レジスタ使用量や速度が退行するGPUでは、この値を下げて再評価すること。
 static const int MAA_SMOOTH_X_PER_ITEM = 8;
 
+
 static int alignSsDim(int srcDim, float ss) {
     const float scaled = (float)srcDim * ss / 4.0f;
     return (int)std::lround(scaled) * 4;
@@ -67,32 +68,58 @@ __device__ __forceinline__ int maa_sn3(int p1, int p2, int p3, int max_val) {
     return clamp(v, 0, max_val);
 }
 
+// The rotations go through a shared-memory tile, so that both the reads and
+// the writes are coalesced (a direct per-pixel transpose strides one of them).
+static const int MAA_TURN_TILE = 32;
+
 template<typename Type>
 __global__ void kernel_maa_fturn_left(const uint8_t *src, const int srcPitch, const int srcWidth,
     uint8_t *dst, const int dstPitch, const int dstWidth, const int dstHeight) {
-    const int x_new = blockIdx.x * blockDim.x + threadIdx.x;
-    const int y_new = blockIdx.y * blockDim.y + threadIdx.y;
-    if (x_new >= dstWidth || y_new >= dstHeight) return;
-
-    const int x_old = srcWidth - 1 - y_new;
-    const int y_old = x_new;
-    const Type *srcPix = (const Type *)(src + y_old * srcPitch + x_old * sizeof(Type));
-    Type *dstPix = (Type *)(dst + y_new * dstPitch + x_new * sizeof(Type));
-    dstPix[0] = srcPix[0];
+    // dst(x, y) = src(srcWidth - 1 - y, x); srcHeight == dstWidth.
+    __shared__ Type tile[MAA_TURN_TILE][MAA_TURN_TILE + 1];
+    const int dstX0 = blockIdx.x * MAA_TURN_TILE;
+    const int dstY0 = blockIdx.y * MAA_TURN_TILE;
+    const int srcX0 = srcWidth - dstY0 - MAA_TURN_TILE; // may be negative on the last tile
+    for (int ty = threadIdx.y; ty < MAA_TURN_TILE; ty += blockDim.y) {
+        const int ys = dstX0 + ty;
+        const int xs = srcX0 + threadIdx.x;
+        if (ys < dstWidth && xs >= 0) {
+            tile[ty][threadIdx.x] = ((const Type *)(src + ys * srcPitch))[xs];
+        }
+    }
+    __syncthreads();
+    for (int ry = threadIdx.y; ry < MAA_TURN_TILE; ry += blockDim.y) {
+        const int yd = dstY0 + ry;
+        const int xd = dstX0 + threadIdx.x;
+        if (xd < dstWidth && yd < dstHeight) {
+            ((Type *)(dst + yd * dstPitch))[xd] = tile[threadIdx.x][MAA_TURN_TILE - 1 - ry];
+        }
+    }
 }
 
 template<typename Type>
 __global__ void kernel_maa_fturn_right(const uint8_t *src, const int srcPitch, const int srcHeight,
     uint8_t *dst, const int dstPitch, const int dstWidth, const int dstHeight) {
-    const int x_new = blockIdx.x * blockDim.x + threadIdx.x;
-    const int y_new = blockIdx.y * blockDim.y + threadIdx.y;
-    if (x_new >= dstWidth || y_new >= dstHeight) return;
-
-    const int x_old = y_new;
-    const int y_old = srcHeight - 1 - x_new;
-    const Type *srcPix = (const Type *)(src + y_old * srcPitch + x_old * sizeof(Type));
-    Type *dstPix = (Type *)(dst + y_new * dstPitch + x_new * sizeof(Type));
-    dstPix[0] = srcPix[0];
+    // dst(x, y) = src(y, srcHeight - 1 - x); srcWidth == dstHeight.
+    __shared__ Type tile[MAA_TURN_TILE][MAA_TURN_TILE + 1];
+    const int dstX0 = blockIdx.x * MAA_TURN_TILE;
+    const int dstY0 = blockIdx.y * MAA_TURN_TILE;
+    const int srcY0 = srcHeight - dstX0 - MAA_TURN_TILE; // may be negative on the last tile
+    for (int ty = threadIdx.y; ty < MAA_TURN_TILE; ty += blockDim.y) {
+        const int ys = srcY0 + ty;
+        const int xs = dstY0 + threadIdx.x;
+        if (ys >= 0 && xs < dstHeight) {
+            tile[ty][threadIdx.x] = ((const Type *)(src + ys * srcPitch))[xs];
+        }
+    }
+    __syncthreads();
+    for (int ry = threadIdx.y; ry < MAA_TURN_TILE; ry += blockDim.y) {
+        const int yd = dstY0 + ry;
+        const int xd = dstX0 + threadIdx.x;
+        if (xd < dstWidth && yd < dstHeight) {
+            ((Type *)(dst + yd * dstPitch))[xd] = tile[MAA_TURN_TILE - 1 - threadIdx.x][ry];
+        }
+    }
 }
 
 template<typename Type, int bit_depth>
@@ -412,8 +439,8 @@ __global__ void kernel_maa_show_darken(const uint8_t *src, const int srcPitch, u
 
 template<typename Type>
 static RGY_ERR maa_fturn_left_plane_typed(RGYFrameInfo *pDst, const RGYFrameInfo *pSrc, cudaStream_t stream) {
-    dim3 blockSize(MAA_BLOCK_X, MAA_BLOCK_Y);
-    dim3 gridSize(divCeil(pDst->width, blockSize.x), divCeil(pDst->height, blockSize.y));
+    dim3 blockSize(MAA_TURN_TILE, MAA_BLOCK_Y);
+    dim3 gridSize(divCeil(pDst->width, MAA_TURN_TILE), divCeil(pDst->height, MAA_TURN_TILE));
     kernel_maa_fturn_left<Type><<<gridSize, blockSize, 0, stream>>>(pSrc->ptr[0], pSrc->pitch[0], pSrc->width,
         pDst->ptr[0], pDst->pitch[0], pDst->width, pDst->height);
     return err_to_rgy(cudaGetLastError());
@@ -421,8 +448,8 @@ static RGY_ERR maa_fturn_left_plane_typed(RGYFrameInfo *pDst, const RGYFrameInfo
 
 template<typename Type>
 static RGY_ERR maa_fturn_right_plane_typed(RGYFrameInfo *pDst, const RGYFrameInfo *pSrc, cudaStream_t stream) {
-    dim3 blockSize(MAA_BLOCK_X, MAA_BLOCK_Y);
-    dim3 gridSize(divCeil(pDst->width, blockSize.x), divCeil(pDst->height, blockSize.y));
+    dim3 blockSize(MAA_TURN_TILE, MAA_BLOCK_Y);
+    dim3 gridSize(divCeil(pDst->width, MAA_TURN_TILE), divCeil(pDst->height, MAA_TURN_TILE));
     kernel_maa_fturn_right<Type><<<gridSize, blockSize, 0, stream>>>(pSrc->ptr[0], pSrc->pitch[0], pSrc->height,
         pDst->ptr[0], pDst->pitch[0], pDst->width, pDst->height);
     return err_to_rgy(cudaGetLastError());
@@ -703,6 +730,7 @@ RGY_ERR NVEncFilterMaa::init(shared_ptr<NVEncFilterParam> pParam, shared_ptr<RGY
         prmUp->frameOut.width = m_ssW;
         prmUp->frameOut.height = m_ssH;
         prmUp->interp = RGY_VPP_RESIZE_SPLINE36;
+        prmUp->separable = true;
         prmUp->baseFps = prm->baseFps;
         prmUp->bOutOverwrite = false;
         m_resizeUp = std::make_unique<NVEncFilterResize>();
@@ -715,6 +743,7 @@ RGY_ERR NVEncFilterMaa::init(shared_ptr<NVEncFilterParam> pParam, shared_ptr<RGY
         prmDn->frameIn.height = m_ssH;
         prmDn->frameOut = prm->frameOut;
         prmDn->interp = RGY_VPP_RESIZE_SPLINE36;
+        prmDn->separable = true;
         prmDn->baseFps = prm->baseFps;
         prmDn->bOutOverwrite = false;
         m_resizeDown = std::make_unique<NVEncFilterResize>();
@@ -731,6 +760,7 @@ RGY_ERR NVEncFilterMaa::init(shared_ptr<NVEncFilterParam> pParam, shared_ptr<RGY
         prmUp->frameOut.width = m_ssW;
         prmUp->frameOut.height = m_ssH;
         prmUp->interp = RGY_VPP_RESIZE_SPLINE36;
+        prmUp->separable = true;
         prmUp->baseFps = prm->baseFps;
         prmUp->bOutOverwrite = false;
         m_resizeUpLuma = std::make_unique<NVEncFilterResize>();
@@ -745,6 +775,7 @@ RGY_ERR NVEncFilterMaa::init(shared_ptr<NVEncFilterParam> pParam, shared_ptr<RGY
         prmDn->frameOut = prm->frameOut;
         prmDn->frameOut.csp = lumaCsp;
         prmDn->interp = RGY_VPP_RESIZE_SPLINE36;
+        prmDn->separable = true;
         prmDn->baseFps = prm->baseFps;
         prmDn->bOutOverwrite = false;
         m_resizeDownLuma = std::make_unique<NVEncFilterResize>();

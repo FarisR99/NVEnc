@@ -416,6 +416,154 @@ void resize_plane(uint8_t *pDst, const int dstPitch, const int dstWidth, const i
         ratioX, ratioY, pgFactor, shared_weightXdim, shared_weightYdim);
 }
 
+// Separable form of kernel_resize. Its 2D weights are products wx * wy and it
+// divides by their sum (sum wx) * (sum wy), so a horizontal pass into a float
+// buffer followed by a vertical pass gives the same result with nx + ny instead
+// of nx * ny taps per output pixel (e.g. 28 instead of 196 for a 2x spline36
+// downscale).
+template<typename Type, RESIZE_WEIGHT_TYPE algo, int radius, int block_x, int block_y>
+__global__ void kernel_resize_sep_h(float *__restrict__ pTmp, const int tmpPitch, const int dstWidth, const int height,
+    const uint8_t *__restrict__ pSrc, const int srcPitch, const int srcWidth,
+    const float ratioX, const float *__restrict__ pgFactor, const int shared_weightXdim) {
+    const float ratioInvX = 1.0f / ratioX;
+    const float ratioClampedX = min(ratioX, 1.0f);
+    const float srcWindowX = radius / ratioClampedX;
+
+    alignas(128) extern __shared__ float shared[];
+    float *weightXshared = shared;
+    float *psCopyFactor  = weightXshared + shared_weightXdim * block_x;
+    int *srcFirstXArr = (int*)(psCopyFactor + ((algo == WEIGHT_SPLINE) ? radius * 4 : 0));
+    int *srcEndXArr   = srcFirstXArr + block_x;
+
+    if (algo == WEIGHT_SPLINE) {
+        if (threadIdx.y == 0 && threadIdx.x < radius * 4) {
+            psCopyFactor[threadIdx.x] = pgFactor[threadIdx.x];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.y == 0) {
+        const int dstX = blockIdx.x * block_x + threadIdx.x;
+        const float srcX = ((float)(dstX + 0.5f)) * ratioInvX;
+        const int srcFirstX = max(0, (int)floorf(srcX - srcWindowX));
+        const int srcEndX = min(srcWidth - 1, (int)ceilf(srcX + srcWindowX));
+        srcFirstXArr[threadIdx.x] = srcFirstX;
+        srcEndXArr[threadIdx.x]   = srcEndX;
+        calc_weight<radius, algo>(weightXshared + threadIdx.x * shared_weightXdim, srcX, srcFirstX, srcEndX, ratioClampedX, psCopyFactor);
+    }
+    __syncthreads();
+
+    const int ix = blockIdx.x * block_x + threadIdx.x;
+    const int iy = blockIdx.y * block_y + threadIdx.y;
+    if (ix < dstWidth && iy < height) {
+        const int srcFirstX = srcFirstXArr[threadIdx.x];
+        const int srcEndX = srcEndXArr[threadIdx.x];
+        const float *pwx = weightXshared + threadIdx.x * shared_weightXdim;
+        const Type *srcPtr = (const Type *)(pSrc + iy * srcPitch) + srcFirstX;
+        float clr = 0.0f;
+        float weightSum = 0.0f;
+        for (int i = srcFirstX; i <= srcEndX; i++, pwx++, srcPtr++) {
+            clr += srcPtr[0] * pwx[0];
+            weightSum += pwx[0];
+        }
+        pTmp[iy * tmpPitch + ix] = clr / weightSum;
+    }
+}
+
+template<typename Type, int bit_depth, RESIZE_WEIGHT_TYPE algo, int radius, int block_x, int block_y>
+__global__ void kernel_resize_sep_v(uint8_t *__restrict__ pDst, const int dstPitch, const int dstWidth, const int dstHeight,
+    const float *__restrict__ pTmp, const int tmpPitch, const int srcHeight,
+    const float ratioY, const float *__restrict__ pgFactor, const int shared_weightYdim) {
+    const float ratioInvY = 1.0f / ratioY;
+    const float ratioClampedY = min(ratioY, 1.0f);
+    const float srcWindowY = radius / ratioClampedY;
+
+    alignas(128) extern __shared__ float shared[];
+    float *weightYshared = shared;
+    float *psCopyFactor  = weightYshared + shared_weightYdim * block_y;
+    int *srcFirstYArr = (int*)(psCopyFactor + ((algo == WEIGHT_SPLINE) ? radius * 4 : 0));
+    int *srcEndYArr   = srcFirstYArr + block_y;
+
+    if (algo == WEIGHT_SPLINE) {
+        if (threadIdx.y == 0 && threadIdx.x < radius * 4) {
+            psCopyFactor[threadIdx.x] = pgFactor[threadIdx.x];
+        }
+        __syncthreads();
+    }
+    if (threadIdx.y == 0 && threadIdx.x < block_y) {
+        const int dstY = blockIdx.y * block_y + threadIdx.x;
+        const float srcY = ((float)(dstY + 0.5f)) * ratioInvY;
+        const int srcFirstY = max(0, (int)floorf(srcY - srcWindowY));
+        const int srcEndY = min(srcHeight - 1, (int)ceilf(srcY + srcWindowY));
+        srcFirstYArr[threadIdx.x] = srcFirstY;
+        srcEndYArr[threadIdx.x]   = srcEndY;
+        calc_weight<radius, algo>(weightYshared + threadIdx.x * shared_weightYdim, srcY, srcFirstY, srcEndY, ratioClampedY, psCopyFactor);
+    }
+    __syncthreads();
+
+    const int ix = blockIdx.x * block_x + threadIdx.x;
+    const int iy = blockIdx.y * block_y + threadIdx.y;
+    if (ix < dstWidth && iy < dstHeight) {
+        const int srcFirstY = srcFirstYArr[threadIdx.y];
+        const int srcEndY = srcEndYArr[threadIdx.y];
+        const float *pwy = weightYshared + threadIdx.y * shared_weightYdim;
+        const float *tmpPtr = pTmp + srcFirstY * tmpPitch + ix;
+        float clr = 0.0f;
+        float weightSum = 0.0f;
+        for (int j = srcFirstY; j <= srcEndY; j++, pwy++, tmpPtr += tmpPitch) {
+            clr += tmpPtr[0] * pwy[0];
+            weightSum += pwy[0];
+        }
+        Type *ptr = (Type *)(pDst + iy * dstPitch + ix * sizeof(Type));
+        ptr[0] = (Type)clamp(clr / weightSum, 0.0f, (1 << bit_depth) - 0.1f);
+    }
+}
+
+static int resize_weight_dim(const float ratio, const int radius) {
+    const float srcWindow = radius / min(ratio, 1.0f);
+    return ((((int)ceilf(srcWindow) + 1) * 2) + 3) & ~3;
+}
+
+template<typename Type, int bit_depth, RESIZE_WEIGHT_TYPE algo, int radius>
+static RGY_ERR resize_plane_sep(RGYFrameInfo *pOutputPlane, const RGYFrameInfo *pInputPlane, const float *pgFactor,
+    float *pTmp, const int tmpPitch, cudaStream_t stream) {
+    const int dstWidth = pOutputPlane->width, dstHeight = pOutputPlane->height;
+    const int srcWidth = pInputPlane->width, srcHeight = pInputPlane->height;
+    const float ratioX = (float)dstWidth / srcWidth;
+    const float ratioY = (float)dstHeight / srcHeight;
+    const int splineFloats = (algo == WEIGHT_SPLINE) ? radius * 4 : 0;
+    dim3 blockSize(RESIZE_BLOCK_X, RESIZE_BLOCK_Y);
+
+    const int weightXdim = resize_weight_dim(ratioX, radius);
+    const int sharedH = (RESIZE_BLOCK_X * weightXdim + splineFloats) * (int)sizeof(float) + RESIZE_BLOCK_X * 2 * (int)sizeof(int);
+    dim3 gridH(divCeil(dstWidth, blockSize.x), divCeil(srcHeight, blockSize.y));
+    kernel_resize_sep_h<Type, algo, radius, RESIZE_BLOCK_X, RESIZE_BLOCK_Y><<<gridH, blockSize, sharedH, stream>>>(
+        pTmp, tmpPitch, dstWidth, srcHeight,
+        (const uint8_t *)pInputPlane->ptr[0], pInputPlane->pitch[0], srcWidth, ratioX, pgFactor, weightXdim);
+
+    const int weightYdim = resize_weight_dim(ratioY, radius);
+    const int sharedV = (RESIZE_BLOCK_Y * weightYdim + splineFloats) * (int)sizeof(float) + RESIZE_BLOCK_Y * 2 * (int)sizeof(int);
+    dim3 gridV(divCeil(dstWidth, blockSize.x), divCeil(dstHeight, blockSize.y));
+    kernel_resize_sep_v<Type, bit_depth, algo, radius, RESIZE_BLOCK_X, RESIZE_BLOCK_Y><<<gridV, blockSize, sharedV, stream>>>(
+        (uint8_t *)pOutputPlane->ptr[0], pOutputPlane->pitch[0], dstWidth, dstHeight,
+        pTmp, tmpPitch, srcHeight, ratioY, pgFactor, weightYdim);
+    return err_to_rgy(cudaGetLastError());
+}
+
+template<typename Type, int bit_depth, RESIZE_WEIGHT_TYPE algo, int radius>
+static RGY_ERR resize_frame_sep(RGYFrameInfo *pOutputFrame, const RGYFrameInfo *pInputFrame, const float *pgFactor,
+    float *pTmp, const int tmpPitch, cudaStream_t stream) {
+    for (int iplane = 0; iplane < RGY_CSP_PLANES[pInputFrame->csp]; iplane++) {
+        const auto plane = (RGY_PLANE)iplane;
+        const auto planeSrc = getPlane(pInputFrame, plane);
+        auto planeOutput = getPlane(pOutputFrame, plane);
+        auto sts = resize_plane_sep<Type, bit_depth, algo, radius>(&planeOutput, &planeSrc, pgFactor, pTmp, tmpPitch, stream);
+        if (sts != RGY_ERR_NONE) {
+            return sts;
+        }
+    }
+    return RGY_ERR_NONE;
+}
+
 template<typename Type, int bit_depth, RESIZE_WEIGHT_TYPE algo, int radius>
 static RGY_ERR resize_plane(RGYFrameInfo *pOutputPlane, const RGYFrameInfo *pInputPlane, const float *pgFactor, cudaStream_t stream) {
     resize_plane<Type, bit_depth, algo, radius>(
@@ -771,6 +919,25 @@ static RGY_ERR resize_frame(RGYFrameInfo *pOutputFrame, const RGYFrameInfo *pInp
     case RGY_VPP_RESIZE_CATMULL_ROM: return resize_frame<Type, bit_depth, WEIGHT_BICUBIC_CATMULL_ROM, 2>(pOutputFrame, pInputFrame, pgFactor, stream);
     case RGY_VPP_RESIZE_HERMITE:     return resize_frame<Type, bit_depth, WEIGHT_BICUBIC_HERMITE,     2>(pOutputFrame, pInputFrame, pgFactor, stream);
     default:  return RGY_ERR_NONE;
+    }
+}
+
+// Separable variant of resize_frame(interp), for the weight-based algorithms.
+// Returns RGY_ERR_UNSUPPORTED for the others, which keep the regular path.
+template<typename Type, int bit_depth>
+static RGY_ERR resize_frame_separable(RGYFrameInfo *pOutputFrame, const RGYFrameInfo *pInputFrame, RGY_VPP_RESIZE_ALGO interp, const float *pgFactor,
+    float *pTmp, const int tmpPitch, cudaStream_t stream) {
+    switch (interp) {
+    case RGY_VPP_RESIZE_BILINEAR: return resize_frame_sep<Type, bit_depth, WEIGHT_BILINEAR, 1>(pOutputFrame, pInputFrame, pgFactor, pTmp, tmpPitch, stream);
+    case RGY_VPP_RESIZE_AREA:     return resize_frame_sep<Type, bit_depth, WEIGHT_AREA,     1>(pOutputFrame, pInputFrame, pgFactor, pTmp, tmpPitch, stream);
+    case RGY_VPP_RESIZE_BICUBIC:  return resize_frame_sep<Type, bit_depth, WEIGHT_BICUBIC,  2>(pOutputFrame, pInputFrame, pgFactor, pTmp, tmpPitch, stream);
+    case RGY_VPP_RESIZE_SPLINE16: return resize_frame_sep<Type, bit_depth, WEIGHT_SPLINE,   2>(pOutputFrame, pInputFrame, pgFactor, pTmp, tmpPitch, stream);
+    case RGY_VPP_RESIZE_SPLINE36: return resize_frame_sep<Type, bit_depth, WEIGHT_SPLINE,   3>(pOutputFrame, pInputFrame, pgFactor, pTmp, tmpPitch, stream);
+    case RGY_VPP_RESIZE_SPLINE64: return resize_frame_sep<Type, bit_depth, WEIGHT_SPLINE,   4>(pOutputFrame, pInputFrame, pgFactor, pTmp, tmpPitch, stream);
+    case RGY_VPP_RESIZE_LANCZOS2: return resize_frame_sep<Type, bit_depth, WEIGHT_LANCZOS,  2>(pOutputFrame, pInputFrame, pgFactor, pTmp, tmpPitch, stream);
+    case RGY_VPP_RESIZE_LANCZOS3: return resize_frame_sep<Type, bit_depth, WEIGHT_LANCZOS,  3>(pOutputFrame, pInputFrame, pgFactor, pTmp, tmpPitch, stream);
+    case RGY_VPP_RESIZE_LANCZOS4: return resize_frame_sep<Type, bit_depth, WEIGHT_LANCZOS,  4>(pOutputFrame, pInputFrame, pgFactor, pTmp, tmpPitch, stream);
+    default: return RGY_ERR_UNSUPPORTED;
     }
 }
 
@@ -1516,7 +1683,8 @@ NVEncFilterParamResize::NVEncFilterParamResize() :
     fsr1(),
     dpid(),
     ngxvsr(),
-    libplaceboResample() {
+    libplaceboResample(),
+    separable(false) {
 }
 
 NVEncFilterParamResize::~NVEncFilterParamResize() {};
@@ -1671,7 +1839,29 @@ RGY_ERR NVEncFilterResize::run_filter(const RGYFrameInfo *pInputFrame, RGYFrameI
                     const float bc[2] = { pResizeParam->bicubic.b, pResizeParam->bicubic.c };
                     cudaMemcpyToSymbolAsync(g_bicubicBC, bc, sizeof(bc), 0, cudaMemcpyHostToDevice, stream);
                 }
-                sts = resize_list.at(RGY_CSP_DATA_TYPE[pInputFrame->csp])(ppOutputFrames[0], pInputFrame, resizeInterp, (m_weightSpline) ? (float *)m_weightSpline->ptr : nullptr, stream);
+                const float *pgFactor = (m_weightSpline) ? (float *)m_weightSpline->ptr : nullptr;
+                sts = RGY_ERR_UNSUPPORTED;
+                if (pResizeParam->separable) {
+                    // The luma plane needs the largest intermediate (input height x output width).
+                    const int tmpPitch = ALIGN(ppOutputFrames[0]->width, 32);
+                    const size_t tmpBytes = (size_t)tmpPitch * pInputFrame->height * sizeof(float);
+                    if (!m_separableTmp || m_separableTmp->nSize < tmpBytes) {
+                        m_separableTmp = std::make_unique<CUMemBuf>(tmpBytes);
+                        if ((sts = m_separableTmp->alloc()) != RGY_ERR_NONE) {
+                            AddMessage(RGY_LOG_ERROR, _T("failed to allocate resize buffer: %s.\n"), get_err_mes(sts));
+                            return sts;
+                        }
+                    }
+                    static const std::map<RGY_DATA_TYPE, decltype(resize_frame_separable<uint8_t, 8>)*> resize_sep_list = {
+                        { RGY_DATA_TYPE_U8,  resize_frame_separable<uint8_t,   8> },
+                        { RGY_DATA_TYPE_U16, resize_frame_separable<uint16_t, 16> }
+                    };
+                    sts = resize_sep_list.at(RGY_CSP_DATA_TYPE[pInputFrame->csp])(ppOutputFrames[0], pInputFrame, resizeInterp, pgFactor,
+                        (float *)m_separableTmp->ptr, tmpPitch, stream);
+                }
+                if (sts == RGY_ERR_UNSUPPORTED) {
+                    sts = resize_list.at(RGY_CSP_DATA_TYPE[pInputFrame->csp])(ppOutputFrames[0], pInputFrame, resizeInterp, pgFactor, stream);
+                }
             }
             if (sts != RGY_ERR_NONE) {
                 AddMessage(RGY_LOG_ERROR, _T("error at resize(%s): %s.\n"),

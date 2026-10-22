@@ -162,6 +162,7 @@ public:
     VppResizeBicubic bicubic;
     std::shared_ptr<NVEncFilterParamNGXVSR> ngxvsr;
     std::shared_ptr<NVEncFilterParamLibplaceboResample> libplaceboResample;
+    bool separable; // weight-based algos: horizontal then vertical pass (same result, far fewer taps)
     NVEncFilterParamResize();
     virtual ~NVEncFilterParamResize();
     virtual tstring print() const override;
@@ -184,6 +185,7 @@ protected:
     bool m_bInterlacedWarn;
     std::unique_ptr<CUMemBuf> m_weightSpline;
     RGY_VPP_RESIZE_ALGO m_weightSplineAlgo;
+    std::unique_ptr<CUMemBuf> m_separableTmp;      // float intermediate of the separable resize
     std::unique_ptr<CUFrameBuf> m_fsr1Easu;
     std::unique_ptr<CUMemBuf> m_weightJinc;        // windowed-jinc EWA LUT (1024 floats), rebuilt per radius
     RGY_VPP_RESIZE_ALGO m_weightJincAlgo;
