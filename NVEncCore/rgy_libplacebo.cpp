@@ -403,7 +403,7 @@ struct alignas(pl_render_params) PLRenderParamsLegacy {
 };
 
 static_assert(sizeof(PLPeakDetectParams338) == sizeof(pl_peak_detect_params));
-static_assert(sizeof(PLRenderBackground338) == offsetof(pl_render_params, skip_anti_aliasing) - offsetof(pl_render_params, background) - sizeof(float));
+static_assert(sizeof(PLRenderBackground338) == offsetof(pl_render_params, skip_anti_aliasing) - offsetof(pl_render_params, background) - 2 * sizeof(float));
 
 static PLPeakDetectParams338 peak_detect_params_to_338(const pl_peak_detect_params& params) {
     PLPeakDetectParams338 legacy = {};
@@ -430,11 +430,27 @@ static pl_peak_detect_params peak_detect_params_from_338(const PLPeakDetectParam
 
 static PLRenderParamsLegacy render_params_to_legacy(const pl_render_params& params, const int apiVersion) {
     PLRenderParamsLegacy legacy = {};
+
+    // API 381 added pl_render_params.transparency; libraries older than that
+    // expect it to be absent.
+    if (apiVersion >= 360) {
+        constexpr auto transparencyOffset = offsetof(pl_render_params, transparency);
+        constexpr auto suffixOffset = offsetof(pl_render_params, skip_anti_aliasing);
+        std::memcpy(legacy.data.data(), &params, transparencyOffset);
+        std::memcpy(legacy.data.data() + transparencyOffset,
+            reinterpret_cast<const uint8_t *>(&params) + suffixOffset,
+            sizeof(pl_render_params) - suffixOffset);
+        return legacy;
+    }
+
     if (apiVersion >= 349) {
+        // 349 and 351 also lack blur_radius (API 355).
         constexpr auto prefixSize = offsetof(pl_render_params, blur_radius);
-        constexpr auto suffixOffset = offsetof(pl_render_params, corner_rounding);
+        constexpr auto suffixOffset = offsetof(pl_render_params, skip_anti_aliasing);
         std::memcpy(legacy.data.data(), &params, prefixSize);
-        std::memcpy(legacy.data.data() + prefixSize,
+        std::memcpy(legacy.data.data() + prefixSize, &params.corner_rounding,
+            sizeof(params.corner_rounding));
+        std::memcpy(legacy.data.data() + prefixSize + sizeof(params.corner_rounding),
             reinterpret_cast<const uint8_t *>(&params) + suffixOffset,
             sizeof(pl_render_params) - suffixOffset);
         return legacy;
@@ -462,13 +478,28 @@ static PLRenderParamsLegacy render_params_to_legacy(const pl_render_params& para
 static pl_render_params render_params_from_legacy(const void *legacyPtr, const int apiVersion) {
     pl_render_params params = {};
     const auto legacy = reinterpret_cast<const uint8_t *>(legacyPtr);
+
+    if (apiVersion >= 360) {
+        // No pl_render_params.transparency before API 381.
+        constexpr auto transparencyOffset = offsetof(pl_render_params, transparency);
+        constexpr auto suffixOffset = offsetof(pl_render_params, skip_anti_aliasing);
+        std::memcpy(&params, legacy, transparencyOffset);
+        std::memcpy(reinterpret_cast<uint8_t *>(&params) + suffixOffset,
+            legacy + transparencyOffset, sizeof(pl_render_params) - suffixOffset);
+        return params;
+    }
+
     if (apiVersion >= 349) {
+        // 349 and 351 also lack blur_radius (API 355).
         constexpr auto prefixSize = offsetof(pl_render_params, blur_radius);
-        constexpr auto suffixOffset = offsetof(pl_render_params, corner_rounding);
+        constexpr auto suffixOffset = offsetof(pl_render_params, skip_anti_aliasing);
         std::memcpy(&params, legacy, prefixSize);
         params.blur_radius = 16.0f;
+        std::memcpy(&params.corner_rounding, legacy + prefixSize,
+            sizeof(params.corner_rounding));
         std::memcpy(reinterpret_cast<uint8_t *>(&params) + suffixOffset,
-            legacy + prefixSize, sizeof(pl_render_params) - suffixOffset);
+            legacy + prefixSize + sizeof(params.corner_rounding),
+            sizeof(pl_render_params) - suffixOffset);
         return params;
     }
 
@@ -520,7 +551,7 @@ static pl_color_system color_system_from_legacy(const pl_color_system colorSyste
 
 pl_render_params RGYLibplaceboLoader::p_render_default_params() const {
 #if PL_API_VER >= 360
-    if (m_apiVersion < 360) {
+    if (m_apiVersion < 381) {
         return render_params_from_legacy(m_pl_render_default_params, m_apiVersion);
     }
 #endif
@@ -563,7 +594,7 @@ pl_vulkan RGYLibplaceboLoader::create_vulkan(pl_log log, const pl_vulkan_params 
 
 bool RGYLibplaceboLoader::render_image(pl_renderer renderer, const pl_frame *image, const pl_frame *target, const pl_render_params *params) const {
 #if PL_API_VER >= 360
-    if (m_apiVersion < 360) {
+    if (m_apiVersion < 381) {
         auto imageLegacy = *image;
         auto targetLegacy = *target;
         imageLegacy.repr.sys = color_system_to_legacy(imageLegacy.repr.sys, m_apiVersion);
