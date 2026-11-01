@@ -59,6 +59,7 @@ class NVRtgmcSharedFramePool {
 public:
     NVRtgmcSharedFramePool(const char *allocStatsTag = "RTGMC shared frame pool");
     std::shared_ptr<CUFrameBuf> acquire(const RGYFrameInfo *frame);
+    void trim(size_t maxFreeFrames);
     void clear();
 private:
     std::vector<std::shared_ptr<CUFrameBuf>> m_pool;
@@ -70,8 +71,10 @@ public:
     VppRtgmc rtgmc;
     rgy_rational<int> timebase;
     bool sharedAnalysisMode;
+    // 内部利用時のresetで残す返却済みEDI画像数。通常経路は従来どおり全解放する。
+    size_t ediPoolResetRetainFrames;
 
-    NVEncFilterParamRtgmc() : rtgmc(), timebase(), sharedAnalysisMode(false) {}
+    NVEncFilterParamRtgmc() : rtgmc(), timebase(), sharedAnalysisMode(false), ediPoolResetRetainFrames(0) {}
     virtual ~NVEncFilterParamRtgmc() {}
     virtual tstring print() const override { return rtgmc.print(); }
 };
@@ -224,7 +227,7 @@ protected:
     RGY_ERR captureIntermediateFrame(const RGYFrameInfo *frame, cudaStream_t stream,
         const std::vector<RGYCudaEvent>& waitEvents);
     RGY_ERR runThrough(size_t filterIdx, RGYFrameInfo *pInputFrame, RGYFrameInfo **ppOutputFrames, int *pOutputFrameNum,
-        cudaStream_t stream, const std::vector<RGYCudaEvent> &wait_events, RGYCudaEvent *event, bool storePending);
+        cudaStream_t stream, const std::vector<RGYCudaEvent> &wait_events, RGYCudaEvent *event, bool storePending, bool finalOutputWritten = false);
     RGY_ERR drainFrom(size_t filterIdx, RGYFrameInfo **ppOutputFrames, int *pOutputFrameNum,
         cudaStream_t stream, RGYCudaEvent *event);
     RGY_ERR returnPendingFrames(RGYFrameInfo **ppOutputFrames, int *pOutputFrameNum);
