@@ -54,6 +54,11 @@
 using std::unique_ptr;
 using std::shared_ptr;
 
+// 常駐プレビューではライターの破棄後も標準出力を保持する。
+void rgy_output_set_preview_server_mode(bool enabled);
+// 常駐プレビューで共有する動作モードを参照する。
+bool rgy_output_is_preview_server_mode();
+
 enum OutputType {
     OUT_TYPE_NONE = 0,
     OUT_TYPE_BITSTREAM,
@@ -504,6 +509,7 @@ struct YUVWriterParam {
     bool bY4m;
     bool y4mTimestamp;
     rgy_rational<int> outputTimebase;
+    RGYPreviewOutputCutoff previewCutoff; // --preview-serverで、pipeへ書く前に捨てるフレームの条件
 };
 
 class RGYOutFrame : public RGYOutput {
@@ -517,9 +523,13 @@ public:
 protected:
     virtual RGY_ERR Init(const TCHAR *strFileName, const VideoInfo *pOutputInfo, const void *prm) override;
 
+    // 出力本体とUV読出用の領域を同じ確保に置き、解像度が変わっても容量を再利用する。
+    std::unique_ptr<uint8_t, aligned_malloc_deleter> m_frameBuffer;
+    size_t m_frameBufferCapacity = 0;
     bool m_bY4m;
     bool m_y4mTimestamp;
     rgy_rational<int> m_outputTimebase;
+    RGYPreviewOutputCutoff m_previewCutoff; // --preview-serverで、pipeへ書く前に捨てるフレームの条件
 };
 
 #endif //__RGY_OUTPUT_H__

@@ -30,7 +30,9 @@
 #define __RGY_INPUT_H__
 
 #include <memory>
+#include <atomic>
 #include <thread>
+#include <utility>
 #include "rgy_osdep.h"
 #include "rgy_tchar.h"
 #include "rgy_log.h"
@@ -166,6 +168,76 @@ public:
     int run(int interlaced, void **dst, const void **src, int width, int src_y_pitch_byte, int src_uv_pitch_byte, int dst_y_pitch_byte, int dst_uv_pitch_byte, int height, int dst_height, int *crop);
 };
 
+// --preview-serverで、Viewerが指定する出力開始時刻(output_start_us)と、実際の出力フレームの時刻を
+// 比べるときの許容幅(µs)。Viewerは開始時刻をµs単位に切り捨てて送ってくるうえ、Viewer側では
+// 範囲の判定に2µsの許容を持ち、y4mの時刻(Xts)も小数6桁へ丸めているため最大0.5µsずれる。
+// これらを合わせた2.5µsを整数に切り上げ、開始時刻よりこの幅だけ手前のフレームまでは書き出す。
+// 余分に数枚書いても、Viewerが不要な分を捨てるだけなので問題ない。
+static const int64_t RGY_PREVIEW_OUTPUT_START_TOLERANCE_US = 3;
+
+// --preview-serverの1回の要求(run)の間だけ、入力の読み込み方の設定を有効にする。
+//
+// 入力の初期化は、パイプラインの初期化の中から(場合によっては別スレッドで)呼ばれるため、
+// サーバの要求の情報を引数で直接渡す経路がない。そこで、このcppファイル内の変数を経由して渡し、
+// RGYInput::configurePreviewWindow()が入力の初期化時に自分の状態(m_preview)へ写し取る。
+// サーバは要求を1つずつ順に処理するので、複数のscopeが同時に有効になることはない。
+// 通常のエンコードや、probe要求ではscopeを作らないので、従来の動作は変わらない。
+class RGYPreviewInputScope {
+    bool m_previousEnabled;
+    std::atomic<bool> *m_previousAbort;
+    int64_t m_previousOutputStartUs;
+public:
+    // 構築時に設定を有効にし、破棄時に構築前の値へ戻す。
+    // enabled       : Viewerが窓の読み込み(RGYPreviewWindowを参照)を要求したrunならtrue。
+    // abort         : Viewerがrunを取り消すとtrueになるフラグ。キーフレームの探索中も確認して中断する。
+    // outputStartUs : Viewerが指定した出力開始時刻(µs、入力の絶対時刻)。これより前の出力はpipeへ書かない。
+    //                 INT64_MINは指定なし。enabledがfalseのときは無視する。
+    RGYPreviewInputScope(bool enabled, std::atomic<bool> *abort, int64_t outputStartUs = INT64_MIN);
+    ~RGYPreviewInputScope();
+};
+
+// --preview-serverで、Viewerが要求した「窓」を読むための状態。
+// 窓は、入力の絶対時刻で表した開始時刻(start)から、指定した枚数(limit)の入力フレームの範囲。
+//
+// 背景: TSなどでは、av_seek_frame()の着地位置が目標より後ろのキーフレームになることがあり、
+// 従来の--seekでは窓の先頭が目標より後ろへずれて、Viewerが目標のフレームを得られないことがあった。
+// そこで、開始時刻以前で最後のキーフレームを自分で探してそこから復号し(RGYInputAvcodec::seekPreviewWindow)、
+// 開始時刻より前に復号されたフレームを判定して扱う(RGYInput::checkPreviewWindow)。
+// 有限の枚数は、開始時刻以降の入力フレームだけで数える。
+struct RGYPreviewWindow {
+    bool enabled;                   // 窓の読み込みを使うか。使えない入力や指定では、従来の--seekの動作に戻す。
+    std::atomic<bool> *abort;       // Viewerからの取消要求。
+    int64_t outputStartUs;          // Viewerが指定した出力開始時刻(µs、入力の絶対時刻)。INT64_MINは指定なし。
+    int64_t start;                  // 窓の開始時刻(timebase単位、入力の絶対時刻)。INT64_MINは未決定。
+    rgy_rational<int> timebase;     // startの単位。
+    int64_t keyPts;                 // 復号を始めたキーフレームの時刻(timebase単位)。INT64_MINは未決定。
+    bool keepBeforeStart;           // 開始時刻より前に復号したフレームも、フィルタへ渡すか(checkPreviewWindowを参照)。
+    int64_t limit;                  // 開始時刻以降に受け取る入力フレームの上限。0は上限なし。
+    std::atomic<int64_t> accepted;  // 開始時刻以降に受け取った入力フレームの数。
+    // 以下はDEBUGログ用の集計。
+    bool report;                    // 入力を閉じるときに集計をログへ出すか。
+    int64_t beforeStart;            // 開始時刻より前に復号したフレームの数。
+    int64_t droppedBeforeStart;     // そのうち、フィルタへ渡さずに捨てた数。
+    int64_t afterLimit;             // 上限に達した後に届いたフレームの数。
+
+    RGYPreviewWindow() :
+        enabled(false), abort(nullptr), outputStartUs(INT64_MIN), start(INT64_MIN), timebase(),
+        keyPts(INT64_MIN), keepBeforeStart(false), limit(0), accepted(0),
+        report(false), beforeStart(0), droppedBeforeStart(0), afterLimit(0) {}
+};
+
+// --preview-serverで、出力(RGYOutFrame)がpipeへ書く前に捨てるフレームの条件。
+// 窓の開始時刻より前のフレームも、時間方向のフィルタの状態を作るためにフィルタへは通すことがあるが、
+// その出力はViewerに不要なので、書き出す直前に捨てる。
+struct RGYPreviewOutputCutoff {
+    bool dropBeforeStart;           // 窓の開始時刻(start)より前の出力を書かない。
+    int64_t start;                  // 窓の開始時刻(timebase単位、入力の絶対時刻)。
+    rgy_rational<int> timebase;     // startの単位。
+    int64_t outputStartUs;          // Viewerが指定した出力開始時刻(µs)。これより前の出力を書かない。INT64_MINは指定なし。
+
+    RGYPreviewOutputCutoff() : dropBeforeStart(false), start(0), timebase(), outputStartUs(INT64_MIN) {}
+};
+
 class RGYInputPrm {
 public:
     int threadCsp;
@@ -175,11 +247,54 @@ public:
     RGYPoolAVFrame *poolFrame;
     tstring tcfileIn;
     rgy_rational<int> timebase;
+    double seekSec; // --seek で先頭を飛ばす秒数。フレーム入力(avi/avs/vpy)で使用
 
     RGYInputPrm() : threadCsp(-1), simdCsp(RGY_SIMD::NONE), threadParamCsp(), poolPkt(nullptr), poolFrame(nullptr),
-        tcfileIn(), timebase() {};
+        tcfileIn(), timebase(), seekSec(0.0) {};
     virtual ~RGYInputPrm() {};
 };
+
+// avi/avs/vpy のように任意フレームを読める入力の開始・終了位置。
+// userFrames は --frames (0は無指定)、srcFrames はソースの総フレーム数。
+// 戻り値は [開始フレーム, 終了フレーム)。終了フレームは含まない。
+// --seek なしのときは、従来どおり --frames で切った範囲を seekRatio で分割する。
+// --seek ありのときは、ソース先頭からの時刻をフレームに直し、その位置から --frames 枚まで読む。
+// seekRatio は並列エンコード用で、--seek 後に残った範囲をさらに分割する。
+inline std::pair<int, int> rgy_apply_frame_seek(const double seekSec, const float seekRatio, const int userFrames, const int srcFrames, const int fpsN, const int fpsD) {
+    const int src = (srcFrames > 0) ? srcFrames : 0;
+    if (seekSec > 0.0 && fpsN > 0 && fpsD > 0 && src > 0) {
+        // frame n の時刻は n * fpsD / fpsN 秒。時刻 >= seekSec になる最初のフレーム。
+        // 秒をマイクロ秒の整数にしてから切り上げ、fps が割り切れないときの端数で1フレームずれないようにする。
+        // ちょうどフレームの時刻 (例: 30fpsで17/30秒) はマイクロ秒への丸めで最大0.5us後ろへずれ、
+        // そのまま切り上げると次のフレームになる。1us以内の差は同じ時刻とみなすため、1us引いてから切り上げる。
+        const int64_t seekUs = (int64_t)(seekSec * 1000000.0 + 0.5);
+        const int64_t den = (int64_t)fpsD * 1000000;
+        const int64_t num = (seekUs - 1) * (int64_t)fpsN;
+        int64_t start64 = (den > 0) ? (num + den - 1) / den : 0;
+        if (start64 < 0) start64 = 0;
+        if (start64 > src) start64 = src;
+        int start = (int)start64;
+        if (seekRatio > 0.0f && src > start) {
+            start += (int)(seekRatio * (float)(src - start));
+            if (start > src) start = src;
+        }
+        int end = src;
+        if (userFrames > 0) {
+            const int64_t limited = (int64_t)start + (int64_t)userFrames;
+            if (limited < (int64_t)end) end = (int)limited;
+        }
+        return std::make_pair(start, end);
+    }
+    int end = src;
+    if (userFrames > 0 && userFrames < end) end = userFrames;
+    int start = 0;
+    if (seekRatio > 0.0f && end > 0) {
+        start = (int)(seekRatio * (float)end);
+        if (start < 0) start = 0;
+        if (start > end) start = end;
+    }
+    return std::make_pair(start, end);
+}
 
 class RGYInput {
 public:
@@ -226,6 +341,19 @@ public:
         return true;
     }
 #pragma warning(pop)
+
+    // 入力の初期化時に呼び、RGYPreviewInputScopeで有効にされた設定を取り込む。
+    // frames: --framesで指定された入力フレームの上限(0は上限なし)。窓では開始時刻以降の枚数として扱う。
+    void configurePreviewWindow(int64_t frames);
+    // 出力(RGYOutFrame)がpipeへ書く前に捨てるフレームの条件を返す。
+    RGYPreviewOutputCutoff previewOutputCutoff() const;
+    bool previewWindowEnabled() const { return m_preview.enabled; }
+    // 開始時刻以降の入力フレームを上限まで受け取ったか。以降は読み込みを打ち切る。
+    bool previewWindowFinished() const { return m_preview.limit > 0 && m_preview.accepted.load() >= m_preview.limit; }
+    bool previewAbortRequested() const { return m_preview.abort && m_preview.abort->load(); }
+    // 復号したフレームを、フィルタへ渡すか(keep)を判定し、窓の枚数を数える。
+    // pts/timebase: 復号したフレームの時刻(入力の絶対時刻)。窓を使わない場合は常にkeep=trueを返す。
+    RGY_ERR checkPreviewWindow(int64_t pts, rgy_rational<int> timebase, bool& keep);
 
     sInputCrop GetInputCropInfo() {
         return m_inputVideoInfo.crop;
@@ -331,6 +459,14 @@ public:
 protected:
     virtual RGY_ERR Init(const TCHAR *strFileName, VideoInfo *pInputInfo, const RGYInputPrm *prm) = 0;
     virtual void CreateInputInfo(const TCHAR *inputTypeName, const TCHAR *inputCSpName, const TCHAR *outputCSpName, const TCHAR *convSIMD, const VideoInfo *inputPrm);
+    // CreateInputInfo の後に呼ぶ。開始フレームの時刻を入力情報へ足す。
+    void addSeekToInputInfo(int startFrame);
+    // 入力全体のフレーム数とfpsをdebugログへ出す。--seek/--framesで切り詰める前の値を渡す。
+    // avs/vpy/aviはlibavformatのDuration行を出さないため、HWEncVppPreviewが
+    // --log-level input=debugでこの行を読み、入力の長さを求める。書式を変えるときはビューワー側も合わせる。
+    void logSourceFrames(int srcFrames) {
+        AddMessage(RGY_LOG_DEBUG, _T("source: %d frames, %d/%d fps\n"), srcFrames, m_inputVideoInfo.fpsN, m_inputVideoInfo.fpsD);
+    }
     virtual RGY_ERR LoadNextFrameInternal(RGYFrame *surface) = 0;
 
     //trim listを参照し、動画の最大フレームインデックスを取得する
@@ -340,6 +476,8 @@ protected:
         }
         return m_trimParam.list[m_trimParam.list.size()-1].fin;
     }
+
+    RGYPreviewWindow m_preview; // --preview-serverの窓の状態。
 
     shared_ptr<EncodeStatus> m_encSatusInfo;
 
@@ -352,7 +490,7 @@ protected:
     tstring m_inputInfo;
     tstring m_readerName;    //読み込みの名前
 
-    std::pair<float, double> m_seek;
+    std::pair<double, double> m_seek;
     sTrimParam m_trimParam;
     RGYPoolAVPacket *m_poolPkt; //AVPacketのpool
     RGYPoolAVFrame *m_poolFrame; //AVFrameのpool

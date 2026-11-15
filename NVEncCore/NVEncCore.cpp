@@ -356,6 +356,7 @@ NVEncCore::NVEncCore() :
     m_parallelEnc(),
     m_devNames(),
     m_pAbortByUser(nullptr),
+    m_pPreviewAbort(nullptr),
     m_cudaSchedule(CU_CTX_SCHED_AUTO),
     m_stCreateEncodeParams(),
     m_dynamicRC(),
@@ -431,6 +432,10 @@ NVEncCore::~NVEncCore() {
 
 void NVEncCore::SetAbortFlagPointer(bool *abortFlag) {
     m_pAbortByUser = abortFlag;
+}
+
+void NVEncCore::SetPreviewAbortFlagPointer(std::atomic<bool> *abortFlag) {
+    m_pPreviewAbort = abortFlag;
 }
 
 //エンコーダが出力使用する色空間を入力パラメータをもとに取得
@@ -934,7 +939,7 @@ RGY_ERR NVEncCore::InitParallelEncode(InEncodeVideoParam *inputParam, std::vecto
 }
 
 RGY_ERR NVEncCore::InitOutput(InEncodeVideoParam *inputParams, NV_ENC_BUFFER_FORMAT encBufferFormat) {
-    const auto outputVideoInfo = videooutputinfo(m_stCodecGUID, encBufferFormat,
+    auto outputVideoInfo = videooutputinfo(m_stCodecGUID, encBufferFormat,
         (inputParams->codec_rgy == RGY_CODEC_RAW || inputParams->codec_rgy == RGY_CODEC_AVCODEC) &&
         (  RGY_CSP_CHROMA_FORMAT[inputParams->outputCsp] == RGY_CHROMAFMT_RGB
         || RGY_CSP_CHROMA_FORMAT[inputParams->outputCsp] == RGY_CHROMAFMT_RGB_PACKED),
@@ -943,6 +948,8 @@ RGY_ERR NVEncCore::InitOutput(InEncodeVideoParam *inputParams, NV_ENC_BUFFER_FOR
         std::make_pair(m_sar.n(), m_sar.d()),
         m_encFps);
     if (inputParams->codec_rgy == RGY_CODEC_RAW || inputParams->codec_rgy == RGY_CODEC_AVCODEC) {
+        // rawではコーデック設定からVUIを復元できないため、フィルタ後に解決した値を渡す。
+        outputVideoInfo.vui = m_encVUI;
         inputParams->common.AVMuxTarget &= ~RGY_MUX_VIDEO;
     }
 
@@ -1469,6 +1476,7 @@ RGY_ERR NVEncCore::Deinitialize() {
     PrintMes(RGY_LOG_DEBUG, _T("Closing logger...\n"));
     m_pLog.reset();
     m_pAbortByUser = nullptr;
+    m_pPreviewAbort = nullptr;
     m_trimParam.list.clear();
     m_trimParam.offset = 0;
     //すべてのエラーをflush - 次回に影響しないように
@@ -2993,7 +3001,8 @@ RGY_ERR NVEncCore::SetInputParam(InEncodeVideoParam *inputParam) {
     return RGY_ERR_NONE;
 }
 
-std::vector<VppType> NVEncCore::InitFiltersCreateVppList(const InEncodeVideoParam *inputParam, const bool cspConvRequired, const bool cropRequired, const RGY_VPP_RESIZE_TYPE resizeRequired) {
+// デバイスに依存する置換より前の列挙を、通常経路とpreviewの履歴判定で共有する。
+std::vector<VppType> NVEncCore::CreateVppFilterOrder(const InEncodeVideoParam *inputParam, const bool cspConvRequired, const bool cropRequired, const RGY_VPP_RESIZE_TYPE resizeRequired) {
     std::vector<VppType> filterPipeline;
     filterPipeline.reserve((size_t)VppType::CL_MAX);
     const bool useInputCspForDeint = inputParam->vpp.deintCsp == VppDeintCsp::Input && vpp_deinterlacer_filter_count_wo_vppnv(inputParam) > 0;
@@ -3124,6 +3133,12 @@ std::vector<VppType> NVEncCore::InitFiltersCreateVppList(const InEncodeVideoPara
     if (inputParam->vpp.anime4k.enable)     filterPipeline.push_back(VppType::CL_ANIME4K);
     if (inputParam->vpp.fruc.enable && !frucBeforeTrueHDR) filterPipeline.push_back(VppType::CL_FRUC);
     if (inputParam->vppnv.nvvfxFrameGen.enable) filterPipeline.push_back(VppType::NVVFX_FRAME_GENERATION);
+
+    return filterPipeline;
+}
+
+std::vector<VppType> NVEncCore::InitFiltersCreateVppList(const InEncodeVideoParam *inputParam, const bool cspConvRequired, const bool cropRequired, const RGY_VPP_RESIZE_TYPE resizeRequired) {
+    auto filterPipeline = CreateVppFilterOrder(inputParam, cspConvRequired, cropRequired, resizeRequired);
 
     if (filterPipeline.size() == 0) {
         return filterPipeline;
@@ -3896,6 +3911,11 @@ RGY_ERR NVEncCore::AddFilterCUDA(std::vector<std::unique_ptr<NVEncFilter>>& cufi
         param->provider = _T("auto");
         param->precision = inputParam->vpp.onnxDeint.precision;
         param->cacheDir = inputParam->vpp.onnx.cacheDir;
+        if (param->cacheDir.empty()) {
+            // provider=auto は TensorRT を優先するため、未指定でもユーザー単位の
+            // engineキャッシュを使う (未指定のままだと実行ごとにengine再構築になる)。
+            param->cacheDir = NVEncFilterOnnx::defaultCacheDir();
+        }
         param->timebase = m_outputTimebase;
         param->mode = inputParam->vpp.onnxDeint.mode;
         param->vhsRestore = inputParam->vpp.onnxDeint.operation == VppOnnxDeintOperation::VhsRestore;
@@ -6111,7 +6131,7 @@ RGY_ERR NVEncCore::initPipeline(const InEncodeVideoParam *prm) {
         const auto inputFrameInfo = m_pFileReader->GetInputFrameInfo();
         const auto inputFpsTimebase = rgy_rational<int>((int)inputFrameInfo.fpsD, (int)inputFrameInfo.fpsN);
         const auto srcTimebase = (m_pFileReader->getInputTimebase().n() > 0 && m_pFileReader->getInputTimebase().is_valid()) ? m_pFileReader->getInputTimebase() : inputFpsTimebase;
-        if (m_trimParam.list.size() > 0 || prm->common.seekToSec > 0.0f) {
+        if (m_trimParam.list.size() > 0 || prm->common.seekToSec > 0.0f || m_pFileReader->previewWindowEnabled()) {
             m_pipelineTasks.push_back(std::make_unique<PipelineTaskTrim>(m_dev.get(), m_trimParam, m_pFileReader.get(), m_parallelEnc.get(),
                 srcTimebase, m_outputTimebase, 0, prm->ctrl.threadParams.get(RGYThreadType::MAIN), m_pLog));
             taskTrim = dynamic_cast<PipelineTaskTrim *>(m_pipelineTasks.back().get());
@@ -6323,9 +6343,9 @@ RGY_ERR NVEncCore::Encode() {
     TCHAR handleEvent[256];
     _stprintf_s(handleEvent, NVENCC_ABORT_EVENT, GetCurrentProcessId());
     auto heAbort = std::unique_ptr<std::remove_pointer<HANDLE>::type, handle_deleter>((HANDLE)CreateEvent(nullptr, TRUE, FALSE, handleEvent));
-    auto checkAbort = [pabort = m_pAbortByUser, &heAbort]() { return ((pabort != nullptr && *pabort) || WaitForSingleObject(heAbort.get(), 0) == WAIT_OBJECT_0) ? true : false; };
+    auto checkAbort = [pabort = m_pAbortByUser, previewAbort = m_pPreviewAbort, &heAbort]() { return ((previewAbort && previewAbort->load()) || (pabort != nullptr && *pabort) || WaitForSingleObject(heAbort.get(), 0) == WAIT_OBJECT_0) ? true : false; };
 #else
-    auto checkAbort = [pabort = m_pAbortByUser]() { return  (pabort != nullptr && *pabort); };
+    auto checkAbort = [pabort = m_pAbortByUser, previewAbort = m_pPreviewAbort]() { return (previewAbort && previewAbort->load()) || (pabort != nullptr && *pabort); };
 #endif
     m_pStatus->SetStart();
 
@@ -6388,8 +6408,9 @@ RGY_ERR NVEncCore::Encode() {
     int64_t eofDrainWriteMsTotal = 0;
     int64_t eofDrainWriteMsMax = 0;
     {
-        auto checkContinue = [&checkAbort](RGY_ERR& err) {
-            if (checkAbort() || stdInAbort()) { err = RGY_ERR_ABORTED; return false; }
+        auto checkContinue = [&checkAbort, this](RGY_ERR& err) {
+            // 常駐時の標準入力は要求受信スレッドだけが読む。
+            if (checkAbort() || (!m_pPreviewAbort && stdInAbort())) { err = RGY_ERR_ABORTED; return false; }
             return err >= RGY_ERR_NONE || err == RGY_ERR_MORE_DATA || err == RGY_ERR_MORE_SURFACE;
         };
         while (checkContinue(err)) {
@@ -6544,7 +6565,9 @@ RGY_ERR NVEncCore::Encode() {
                     if (stopwatchOutput) stopwatchOutput->add(0, 0);
                 }
             }
-            if (flushFailed) {
+            // while条件での中断も外側へ伝え、次反復でerrを初期化しない。
+            // 進捗なしのままflush用の空作業を追加し続けるのを防ぐ。
+            if (flushFailed || err == RGY_ERR_ABORTED) {
                 break;
             }
             if (dataqueue.empty()) {
@@ -7019,13 +7042,18 @@ NVENCSTATUS NVEncCore::Encode() {
             }
         }
         PrintMes(RGY_LOG_TRACE, _T("check_pts(%d): nOutEstimatedPts %lld, outPtsSource %lld, outDuration %d\n"), pInputFrame->getFrameInfo().inputFrameId, nOutEstimatedPts, outPtsSource, outDuration);
-        if (nOutFirstPts == AV_NOPTS_VALUE) {
+        const bool firstInputPts = nOutFirstPts == AV_NOPTS_VALUE;
+        if (firstInputPts) {
             nOutFirstPts = outPtsSource; //最初のpts
             PrintMes(RGY_LOG_TRACE, _T("check_pts: nOutFirstPts %lld\n"), outPtsSource);
         }
         //最初のptsを0に修正
         if (!m_timestampPassThrough) {
             outPtsSource -= nOutFirstPts;
+        }
+        if (firstInputPts && (vpp_rff || vpp_afs_rff_aware)) {
+            // 初回の入力原点をgapと誤認しないよう、正規化後の入力と同じ時計から推定を始める。
+            nOutEstimatedPts = outPtsSource;
         }
         if (outPtsSource < 0) {
             PrintMes(RGY_LOG_WARN, _T("check_pts: Invalid timestamp calculated from input frame #%d: timestamp %lld (-%lld), timebase %d/%d.\n"),

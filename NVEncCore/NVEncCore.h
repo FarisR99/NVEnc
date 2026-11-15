@@ -28,6 +28,7 @@
 
 #pragma once
 
+#include <atomic>
 #include "NVEncPipeline.h"
 #include "NVEncFilterSsim.h"
 #include "rgy_device_usage.h"
@@ -46,6 +47,8 @@ tstring get_codec_level_name(RGY_CODEC codec, int level);
 
 class NVEncCore : public NVEncCtrl {
 public:
+    // GPU初期化なしで有効処理の列挙だけを取得する。
+    static std::vector<VppType> CreateVppFilterOrder(const InEncodeVideoParam *inputParam, const bool cspConvRequired, const bool cropRequired, const RGY_VPP_RESIZE_TYPE resizeRequired);
     NVEncCore();
     virtual ~NVEncCore();
 
@@ -66,6 +69,7 @@ public:
 
     //ユーザーからの中断を知らせるフラグへのポインタをセット
     void SetAbortFlagPointer(bool *abortFlag);
+    void SetPreviewAbortFlagPointer(std::atomic<bool> *abortFlag);
 protected:
     bool encodeIsHighBitDepth(const InEncodeVideoParam *inputParam) const;
 
@@ -179,6 +183,8 @@ protected:
     std::vector<tstring>         m_devNames;
 
     bool                        *m_pAbortByUser;          //ユーザーからの中断指令
+
+    std::atomic<bool>           *m_pPreviewAbort;
 
     CUctx_flags                  m_cudaSchedule;          //CUDAのスケジュール
 

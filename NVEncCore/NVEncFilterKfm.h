@@ -539,6 +539,7 @@ protected:
     RGY_ERR readbackFMCounts(std::array<RGYKFM::FMCount, 18>& counts, int cycle, bool drain, cudaStream_t stream);
     RGY_ERR clearPendingFMCounts();
     RGY_ERR analyzeAvailableSource(bool drain, cudaStream_t stream);
+    void invalidateStaticFlagCache();
     RGY_ERR clearStaticFlag(cudaStream_t stream, const std::vector<RGYCudaEvent> &wait_events, RGYCudaEvent *event = nullptr);
     RGY_ERR analyzeStaticFlag(cudaStream_t stream, const std::vector<RGYCudaEvent> &wait_events, RGYCudaEvent *event);
     RGY_ERR analyzeStaticFlag(int sourceIndex, cudaStream_t stream, const std::vector<RGYCudaEvent> &wait_events, RGYCudaEvent *event);
@@ -775,11 +776,15 @@ protected:
     std::deque<KfmMainIntermediateGroup> m_deint60IntermediateQueue;
     std::deque<KfmCachedUcfNoise> m_ucfNoiseCache;
     std::deque<KfmPendingUcfNoiseResult> m_pendingUcfNoiseResults;
-    std::deque<std::unique_ptr<CUMemBuf>> m_fmCountBufPool;
+    std::deque<std::unique_ptr<CUMemBufPair>> m_fmCountBufPool;
     std::deque<std::unique_ptr<CUMemBufPair>> m_ucfNoiseResultBufPool;
     std::deque<KfmUcfNoiseDumpRecord> m_ucfNoiseResultCache;
     KfmUcfNoiseDumpRecord m_pendingUcfNoiseDump;
     std::unique_ptr<CUFrameBuf> m_staticFlag;
+    // 同じ元フレームの2フィールドで共有し、端の参照先が変われば再計算する。
+    std::array<int, 3> m_staticFlagCacheKey;
+    RGYCudaEvent m_staticFlagCacheEvent;
+    bool m_staticFlagCacheValid;
     std::array<std::unique_ptr<CUFrameBuf>, 5> m_staticWorkFrames;
     std::array<std::unique_ptr<CUMemBuf>, 2> m_analyzeFlags;
     std::deque<KfmPendingFMCount> m_pendingFMCounts;

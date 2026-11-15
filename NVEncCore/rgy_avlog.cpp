@@ -26,6 +26,7 @@
 // ------------------------------------------------------------------------------------------
 
 #include <memory>
+#include <mutex>
 #include "rgy_version.h"
 
 #if ENABLE_AVSW_READER
@@ -34,11 +35,20 @@
 #include "rgy_avlog.h"
 
 static std::weak_ptr<RGYLog> g_pQSVLog;
-static int print_prefix = 1;
+// 登録の切替とcallbackからのweak_ptrへのアクセスを同期する。
+static std::mutex g_avLogMutex;
+static thread_local int print_prefix = 1;
 static std::atomic<bool> g_bSetCustomLog(false);
 
 static void av_qsv_log_callback(void *ptr, int level, const char *fmt, va_list vl) {
+    std::shared_ptr<RGYLog> pQSVLog;
+    {
+        std::lock_guard<std::mutex> lock(g_avLogMutex);
+        pQSVLog = g_pQSVLog.lock();
+    }
+    if (!pQSVLog) return;
     const auto rgy_log_level = log_level_av2rgy(level);
+    if (rgy_log_level < pQSVLog->getLogLevel(RGY_LOGT_LIBAV)) return;
 
     char mes[4096];
     va_list vl2;
@@ -51,24 +61,23 @@ static void av_qsv_log_callback(void *ptr, int level, const char *fmt, va_list v
             return;
         }
     }
-    if (auto pQSVLog = g_pQSVLog.lock()) {
-        if (rgy_log_level >= pQSVLog->getLogLevel(RGY_LOGT_LIBAV))  {
-            if (pQSVLog->logFileAvail()) {
-                pQSVLog->write_log(rgy_log_level, RGY_LOGT_LIBAV, char_to_tstring(mes, CP_UTF8).c_str(), true);
-            }
-            av_log_default_callback(ptr, level, fmt, vl2);
-        }
+    if (pQSVLog->logFileAvail()) {
+        pQSVLog->write_log(rgy_log_level, RGY_LOGT_LIBAV, char_to_tstring(mes, CP_UTF8).c_str(), true);
     }
+    av_log_default_callback(ptr, level, fmt, vl2);
     va_end(vl2);
 }
 
 void av_qsv_log_set(std::shared_ptr<RGYLog>& pQSVLog) {
+    std::lock_guard<std::mutex> lock(g_avLogMutex);
     g_pQSVLog = pQSVLog;
     g_bSetCustomLog = true;
     av_log_set_callback(av_qsv_log_callback);
 }
 
-void av_qsv_log_free() {
+void av_qsv_log_free(const std::shared_ptr<RGYLog>& owner) {
+    std::lock_guard<std::mutex> lock(g_avLogMutex);
+    if (owner && g_pQSVLog.lock() != owner) return;
     if (g_bSetCustomLog) {
         g_bSetCustomLog = false;
         av_log_set_callback(av_log_default_callback);

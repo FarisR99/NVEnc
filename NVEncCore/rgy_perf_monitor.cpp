@@ -36,6 +36,7 @@
 #include <string>
 #include "rgy_status.h"
 #include "rgy_perf_monitor.h"
+#include "rgy_output.h"
 #include "rgy_resource.h"
 #include "cpu_info.h"
 #include "rgy_osdep.h"
@@ -641,6 +642,10 @@ std::string CPerfMonitor::write_header(int nSelect) {
 
 #if ENABLE_PERF_COUNTER
 void CPerfMonitor::runCounterThread() {
+#if ENCODER_QSV
+    // Init前とmonitor初期化内の両入口を止め、常駐でWMIthreadを生成しない。
+    if (rgy_output_is_preview_server_mode()) return;
+#endif
     if (!m_perfCounter) {
         OSVERSIONINFOEXW osver;
         getOSVersion(&osver);

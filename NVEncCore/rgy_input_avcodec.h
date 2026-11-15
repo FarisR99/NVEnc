@@ -29,6 +29,7 @@
 #ifndef __RGY_INPUT_AVCODEC_H__
 #define __RGY_INPUT_AVCODEC_H__
 
+#include <deque>
 #include "rgy_input.h"
 #include "rgy_version.h"
 
@@ -869,7 +870,7 @@ public:
     RGYAVSync      AVSyncMode;              //音声・映像同期モード
     int            procSpeedLimit;          //プリデコードする場合の処理速度制限 (0で制限なし)
     float          seekRatio;               //指定された割合に頭出しする
-    float          seekSec;                 //指定された秒数分先頭を飛ばす
+    double         seekSec;                 //指定された秒数分先頭を飛ばす
     double         seekToSec;               //終了時刻(秒)
     tstring        logFramePosList;         //FramePosListの内容を入力終了時に出力する (デバッグ用)
     tstring        logCopyFrameData;        //frame情報copy関数のログ出力先 (デバッグ用)
@@ -1036,6 +1037,13 @@ protected:
 
     RGY_ERR initFormatCtx(const TCHAR *strFileName, const RGYInputAvcodecPrm *input_prm, const int iretry);
     RGY_ERR initVideoBsfs();
+    // --preview-serverの窓で、開始時刻(target)以前で最後のキーフレームを探して、そこから読める状態にする。
+    // origin: ファイルの最初のキーフレームの時刻。詳細と戻り値はcpp側を参照。
+    RGY_ERR seekPreviewWindow(int64_t origin, int64_t target);
+    // m_previewSeekPacketsに保持したパケットを先に返し、なくなったらファイルから読む。
+    int readPreviewPacket(AVPacket *packet);
+    // seekPreviewWindowがキーフレームの探索中に読み、見つけたキーフレーム以降として保持したパケット。
+    std::deque<std::unique_ptr<AVPacket, RGYAVDeleter<AVPacket>>> m_previewSeekPackets;
     int findStreamInProgram(const AVProgram *prog, AVMediaType type, int nth) const;
     const AVProgram *getFollowProgram() const;
     RGY_ERR initPmtFollow(const bool disableFollow);

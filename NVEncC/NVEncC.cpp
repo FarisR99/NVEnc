@@ -50,6 +50,10 @@
 #include "NVEncFilterAfs.h"
 #include "NVEncCmd.h"
 #include "rgy_cmd_selftest.h"
+#include "rgy_help_selftest_cases.h"
+#include "NVEncHelpCodegenCases.h"
+#include "rgy_preview_server.h"
+#include "rgy_preview_history.h"
 #include "NVEncCore.h"
 
 static void show_version() {
@@ -197,13 +201,19 @@ int parse_print_options(const TCHAR *option_name, const TCHAR *arg1, const RGYPa
     }
     if (IS_OPTION("check-cmd-parse")) {
         // コマンドラインのパーサと生成の対応関係を自己診断する
+        const tstring filter = (arg1[0] != _T('-')) ? arg1 : _T("");
+        if (filter == _T("help-test")) return rgy_help_selftest_cases();
+        if (filter == _T("help-codegen-test")) return rgy_help_codegen_cases();
+        const bool helpMode = filter == _T("help") || filter.compare(0, 5, _T("help:")) == 0;
         RGYCmdSelfTest<InEncodeVideoParam> selftest(
             [](InEncodeVideoParam *prm, const std::vector<tstring>& args) {
                 auto argv = rgy_cmd_selftest_argv(args);
                 return parse_cmd(prm, (int)argv.size() - 1, argv.data());
             },
-            [](const InEncodeVideoParam *prm) { return gen_cmd(prm, false); });
-        return selftest.run((arg1[0] != _T('-')) ? arg1 : _T(""));
+            // 無効なフィルタの状態も保存し、生成省略による偽の一致を防ぐ。
+            [helpMode](const InEncodeVideoParam *prm) { return gen_cmd(prm, helpMode); });
+        if (helpMode) return selftest.runHelpValidation(encoder_help(), filter == _T("help") ? tstring() : filter.substr(5));
+        return selftest.run(filter);
     }
     if (IS_OPTION("check-features")) {
         int deviceid = 0;
@@ -414,10 +424,77 @@ static int set_signal_handler() {
     return ret;
 }
 
+// 通常起動と常駐要求で同じエンコード経路を使い、終了時のリソースも要求ごとに破棄する。
+static RGY_ERR run_encode_params(InEncodeVideoParam& params, std::atomic<bool> *previewAbort = nullptr) {
+    NVEncCore nvEnc;
+    auto sts = nvEnc.Init(&params);
+    if (sts != RGY_ERR_NONE) return sts;
+    if (previewAbort) {
+        nvEnc.SetPreviewAbortFlagPointer(previewAbort);
+    } else {
+        nvEnc.SetAbortFlagPointer(&g_signal_abort);
+        set_signal_handler();
+    }
+    nvEnc.PrintEncodingParamsInfo(RGY_LOG_INFO);
+    return nvEnc.Encode();
+}
+
 int _tmain(int argc, TCHAR **argv) {
 #if defined(_WIN32) || defined(_WIN64)
     _tsetlocale(LC_CTYPE, _T(".UTF8"));
 #endif //#if defined(_WIN32) || defined(_WIN64)
+
+    bool previewServer = false;
+    for (int iarg = 1; iarg < argc; ++iarg) {
+        if (_tcscmp(argv[iarg], _T("--preview-server")) == 0) previewServer = true;
+    }
+    if (previewServer) {
+        std::vector<tstring> defaults;
+        for (int iarg = 1; iarg < argc; ++iarg) {
+            if (_tcscmp(argv[iarg], _T("--preview-server")) == 0) continue;
+            if (_tcscmp(argv[iarg], _T("--log-level")) != 0 || iarg + 1 >= argc) {
+                _ftprintf(stderr, _T("--preview-server: Invalid startup arguments.\n"));
+                return 1;
+            }
+            defaults.push_back(argv[iarg]);
+            defaults.push_back(argv[++iarg]);
+        }
+        rgy_output_set_preview_server_mode(true);
+        auto callback = [defaults](const std::vector<tstring>& args, std::atomic<bool> *abort, bool windowSeek, int64_t outputStartUs) -> RGY_ERR {
+            RGYPreviewInputScope windowScope(windowSeek, abort, outputStartUs);
+            auto mergedArgs = defaults;
+            mergedArgs.insert(mergedArgs.end(), args.begin(), args.end());
+            auto previewArgv = rgy_cmd_selftest_argv(mergedArgs);
+            InEncodeVideoParam params;
+            if (parse_cmd(&params, (int)previewArgv.size() - 1, previewArgv.data()) != 0) return RGY_ERR_INVALID_PARAM;
+            // 出力開始時刻(outputStartUs)は入力の絶対時刻なので、出力の時刻が入力の絶対時刻になる場合だけ受け付ける。
+            // 窓の読み込みと--timestamp-passthroughが必要で、--trimや割合指定の--seekとは組み合わせない。
+            // --seekなし(先頭から読む)の要求は、先頭のフレームから表示に使うので、出力開始時刻を指定する対象にしない。
+            if (outputStartUs != INT64_MIN && (!windowSeek || !params.common.timestampPassThrough
+                || params.common.seekSec <= 0 || params.common.seekRatio > 0
+                || params.common.nTrimCount > 0)) return RGY_ERR_INVALID_PARAM;
+            const auto result = run_encode_params(params, abort);
+            // 入力初期化中の取消も、一般の入力エラーではなくrunの取消として返す。
+            return windowSeek && abort && abort->load() && result != RGY_ERR_NONE ? RGY_ERR_ABORTED : result;
+        };
+        auto probe = [defaults](const std::vector<tstring>& args, bool& history) -> RGY_ERR {
+            history = true;
+            auto mergedArgs = defaults;
+            mergedArgs.insert(mergedArgs.end(), args.begin(), args.end());
+            auto previewArgv = rgy_cmd_selftest_argv(mergedArgs);
+            InEncodeVideoParam params;
+            if (parse_cmd(&params, (int)previewArgv.size() - 1, previewArgv.data()) != 0) return RGY_ERR_INVALID_PARAM;
+            if (rgy_preview_external_history(params)) return RGY_ERR_NONE;
+            if (params.vppnv.deinterlace != cudaVideoDeinterlaceMode_Weave) return RGY_ERR_NONE;
+            const auto filters = NVEncCore::CreateVppFilterOrder(&params, false, cropEnabled(params.input.crop), rgy_preview_resize_type(params.input, params.vpp));
+            for (const auto type : filters) {
+                if (rgy_preview_filter_depends_on_history(type, params.vpp)) return RGY_ERR_NONE;
+            }
+            history = false;
+            return RGY_ERR_NONE;
+        };
+        return rgy_preview_server_main(callback, "NVEnc", VER_STR_FILEVERSION, probe, true, true);
+    }
 
     if (argc == 1) {
         show_version();
@@ -565,14 +642,5 @@ int _tmain(int argc, TCHAR **argv) {
         return processMonitorRGYDeviceUsage(encPrm.deviceID);
     }
 
-    int ret = 1;
-
-    NVEncCore nvEnc;
-    if (   RGY_ERR_NONE == nvEnc.Init(&encPrm)) {
-        nvEnc.SetAbortFlagPointer(&g_signal_abort);
-        set_signal_handler();
-        nvEnc.PrintEncodingParamsInfo(RGY_LOG_INFO);
-        ret = (RGY_ERR_NONE == nvEnc.Encode()) ? 0 : 1;
-    }
-    return ret;
+    return run_encode_params(encPrm) == RGY_ERR_NONE ? 0 : 1;
 }

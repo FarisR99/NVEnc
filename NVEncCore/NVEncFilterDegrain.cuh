@@ -1898,6 +1898,32 @@ __device__ __forceinline__ uint32_t degrainMotionSearchSgblockSad(
             for (int y = lane / loadsPerRow; y < blockSize; y += subgroupSize / loadsPerRow) {
                 const uint8_t *ref = fastReferencePlane + (referenceY + y) * pitch + referenceX + x;
                 const uint32_t *src = reinterpret_cast<const uint32_t *>(sourceBlockPixels + y * blockSize + x);
+                // 末尾wordの追加最大3byteも可視領域内に限定し、最終行でもpitch外を読まない。
+                if (pitch >= width && (pitch & 3) == 0
+                    && referenceX + blockSize <= width - 3
+                    && (reinterpret_cast<uintptr_t>(fastReferencePlane) & 3) == 0) {
+                    const uintptr_t refAddress = reinterpret_cast<uintptr_t>(ref);
+                    const int byteOffset = (int)(refAddress & 3);
+                    const uint32_t *alignedRef = reinterpret_cast<const uint32_t *>(refAddress & ~uintptr_t(3));
+                    const uint32_t w0 = alignedRef[0];
+                    const uint32_t w1 = alignedRef[1];
+                    const uint32_t w2 = alignedRef[2];
+                    const uint32_t w3 = alignedRef[3];
+                    uint32_t p0 = w0, p1 = w1, p2 = w2, p3 = w3;
+                    if (byteOffset != 0) {
+                        const uint32_t w4 = alignedRef[4];
+                        const uint32_t selector = 0x3210u + byteOffset * 0x1111u;
+                        p0 = __byte_perm(w0, w1, selector);
+                        p1 = __byte_perm(w1, w2, selector);
+                        p2 = __byte_perm(w2, w3, selector);
+                        p3 = __byte_perm(w3, w4, selector);
+                    }
+                    sad += __vsadu4(src[0], p0);
+                    sad += __vsadu4(src[1], p1);
+                    sad += __vsadu4(src[2], p2);
+                    sad += __vsadu4(src[3], p3);
+                    continue;
+                }
                 // 参照MVは非整列になり得るので、16画素を4画素ずつ安全に読み出す。
                 #pragma unroll
                 for (int q = 0; q < 4; q++) {
@@ -2556,22 +2582,79 @@ __device__ __forceinline__ int degrainRep0RepairValue(
     return degrainClampInt(repair, lo, hi);
 }
 
-template<typename TypePixel>
+template<typename TypePixel, bool refine, bool repair>
 static __global__ void kernel_degrain_temporal_smooth_luma_cuda(
     const uint8_t *prev2, const uint8_t *prev, const uint8_t *cur, const uint8_t *next, const uint8_t *next2,
     const int srcPitch, uint8_t *dst, const int dstPitch, const int width, const int height,
-    const int tr0, const int searchRefine, const int rep0, const int tvRange) {
-    const int x = (int)(blockIdx.x * blockDim.x + threadIdx.x);
-    const int y = (int)(blockIdx.y * blockDim.y + threadIdx.y);
-    if (x >= width || y >= height) {
-        return;
+    const int tr0, const int tvRange) {
+    constexpr int tileWidth = DEGRAIN_BLOCK_X, tileHeight = DEGRAIN_BLOCK_Y;
+    constexpr int halo = repair ? 2 : 0, preHeight = tileHeight + 2 * halo;
+    const int lx = threadIdx.x, ly = threadIdx.y;
+    const int index = ly * tileWidth + lx;
+    const int originX = blockIdx.x * tileWidth, originY = blockIdx.y * tileHeight;
+    const int x = originX + lx, y = originY + ly;
+    int analysisValue = 0;
+    if constexpr (!refine && !repair) {
+        if (x >= width || y >= height) return;
+        analysisValue = degrainTemporalSmoothValue<TypePixel>(prev2, srcPitch, prev, srcPitch, cur, srcPitch, next, srcPitch, next2, srcPitch, width, height, x, y, tr0);
+    } else {
+        // 画像外のスレッドも境界画素の生成と同期に参加する。
+        __shared__ int temporal[refine ? preHeight + 2 : 1][refine ? tileWidth + 2 : 1];
+        __shared__ int prefilter[repair ? preHeight : 1][repair ? tileWidth : 1];
+        if constexpr (refine) {
+            for (int i = index; i < (tileWidth + 2) * (preHeight + 2); i += tileWidth * tileHeight) {
+                const int tx = i % (tileWidth + 2), ty = i / (tileWidth + 2);
+                temporal[ty][tx] = degrainTemporalSmoothValue<TypePixel>(prev2, srcPitch, prev, srcPitch, cur, srcPitch, next, srcPitch, next2, srcPitch, width, height, originX + tx - 1, originY + ty - halo - 1, tr0);
+            }
+            __syncthreads();
+        }
+        for (int i = index; i < tileWidth * preHeight; i += tileWidth * tileHeight) {
+            const int px = i % tileWidth, py = i / tileWidth;
+            int value;
+            if constexpr (refine) {
+                const int p00 = temporal[py][px], p10 = temporal[py][px + 1], p20 = temporal[py][px + 2];
+                const int p01 = temporal[py + 1][px], p11 = temporal[py + 1][px + 1], p21 = temporal[py + 1][px + 2];
+                const int p02 = temporal[py + 2][px], p12 = temporal[py + 2][px + 1], p22 = temporal[py + 2][px + 2];
+                value = degrainSearchRefine1Blend<TypePixel>(p11, degrainBlur3x3Weighted(p00, p10, p20, p01, p11, p21, p02, p12, p22), degrainEdgeSoftenCross(p01, p10, p11, p12, p21), p01, p10, p21, p12);
+            } else {
+                value = degrainTemporalSmoothValue<TypePixel>(prev2, srcPitch, prev, srcPitch, cur, srcPitch, next, srcPitch, next2, srcPitch, width, height, originX + px, originY + py - halo, tr0);
+            }
+            if constexpr (repair) prefilter[py][px] = value;
+            else analysisValue = value;
+        }
+        if constexpr (repair) {
+            __syncthreads();
+            const int p0 = prefilter[ly + 2][lx], p1u = prefilter[ly + 1][lx], p1d = prefilter[ly + 3][lx];
+            const int p2u = prefilter[ly][lx], p2d = prefilter[ly + 4][lx];
+            const int vertAvg = (p1u + p1d + 1) >> 1;
+            const int flatness = abs(p1u - p1d) + (abs(p2u - p2d) >> 1);
+            const int threshold = max(flatness + max(degrainPixelMax<TypePixel>() / 64, 1), max(degrainPixelMax<TypePixel>() / 32, 1));
+            analysisValue = p0;
+            if (abs(p0 - vertAvg) > threshold) {
+                const int lo = min(min(p1u, p1d), min(p2u, p2d));
+                const int hi = max(max(p1u, p1d), max(p2u, p2d));
+                analysisValue = degrainClampInt((p0 + 3 * vertAvg + 2) >> 2, lo, hi);
+            }
+        }
+        if (x >= width || y >= height) return;
     }
-
-    const int analysisValue = (rep0 >= 1)
-        ? degrainRep0RepairValue<TypePixel>(prev2, srcPitch, prev, srcPitch, cur, srcPitch, next, srcPitch, next2, srcPitch, width, height, x, y, tr0, searchRefine)
-        : degrainAnalysisPrefilterValue<TypePixel>(prev2, srcPitch, prev, srcPitch, cur, srcPitch, next, srcPitch, next2, srcPitch, width, height, x, y, tr0, searchRefine);
     *(TypePixel *)(dst + y * dstPitch + x * (int)sizeof(TypePixel)) =
         degrainClampPixel<TypePixel>(degrainAnalysisLumaToFullRange<TypePixel>(analysisValue, tvRange));
+}
+
+template<typename TypePixel>
+static void launchDegrainLumaVariant(dim3 grid, dim3 block, cudaStream_t stream,
+    const uint8_t *prev2, const uint8_t *prev, const uint8_t *cur, const uint8_t *next, const uint8_t *next2,
+    int srcPitch, uint8_t *dst, int dstPitch, int width, int height, int tr0, int searchRefine, int rep0, int tvRange) {
+#define LAUNCH_DEGRAIN_LUMA(refine, repair) kernel_degrain_temporal_smooth_luma_cuda<TypePixel, refine, repair><<<grid, block, 0, stream>>>(prev2, prev, cur, next, next2, srcPitch, dst, dstPitch, width, height, tr0, tvRange)
+    if (searchRefine >= 1) {
+        if (rep0 >= 1) { LAUNCH_DEGRAIN_LUMA(true, true); }
+        else { LAUNCH_DEGRAIN_LUMA(true, false); }
+    } else {
+        if (rep0 >= 1) { LAUNCH_DEGRAIN_LUMA(false, true); }
+        else { LAUNCH_DEGRAIN_LUMA(false, false); }
+    }
+#undef LAUNCH_DEGRAIN_LUMA
 }
 
 static RGY_ERR launchNVEncDegrainTemporalSmoothLumaImpl(
@@ -2580,11 +2663,11 @@ static RGY_ERR launchNVEncDegrainTemporalSmoothLumaImpl(
     const auto block = dim3(DEGRAIN_BLOCK_X, DEGRAIN_BLOCK_Y);
     const auto grid = dim3(divCeil(dst.width, DEGRAIN_BLOCK_X), divCeil(dst.height, DEGRAIN_BLOCK_Y));
     if (RGY_CSP_BIT_DEPTH[cur.csp] > 8) {
-        kernel_degrain_temporal_smooth_luma_cuda<uint16_t><<<grid, block, 0, stream>>>(
+        launchDegrainLumaVariant<uint16_t>(grid, block, stream,
             prev2.ptr[0], prev.ptr[0], cur.ptr[0], next.ptr[0], next2.ptr[0], cur.pitch[0], dst.ptr[0], dst.pitch[0],
             dst.width, dst.height, tr0, searchRefine, rep0, tvRange);
     } else {
-        kernel_degrain_temporal_smooth_luma_cuda<uint8_t><<<grid, block, 0, stream>>>(
+        launchDegrainLumaVariant<uint8_t>(grid, block, stream,
             prev2.ptr[0], prev.ptr[0], cur.ptr[0], next.ptr[0], next2.ptr[0], cur.pitch[0], dst.ptr[0], dst.pitch[0],
             dst.width, dst.height, tr0, searchRefine, rep0, tvRange);
     }
@@ -3977,7 +4060,7 @@ __device__ __forceinline__ void degrainDegrainOverlapPlaneRampGeneric(
     dst[y * dstPitch + x] = degrainClampPixel<TypePixel>(result);
 }
 
-template<typename TypePixel, int refs, bool useMixPlan>
+template<typename TypePixel, int refs, bool useMixPlan, bool fixedLayout = false>
 static __global__ void kernel_degrain_degrain_overlap_plane_ramp_cuda(
     TypePixel *dst,
     const int dst_pitch,
@@ -4026,13 +4109,13 @@ static __global__ void kernel_degrain_degrain_overlap_plane_ramp_cuda(
         width, height,
         mv,
         blocksX, blocksY,
-        blockSize, overlap, step,
+        fixedLayout ? 32 : blockSize, fixedLayout ? 16 : overlap, fixedLayout ? 16 : step,
         coveredWidth, coveredHeight,
-        planeScaleX, planeScaleY,
+        fixedLayout ? 1 : planeScaleX, fixedLayout ? 1 : planeScaleY,
         windowRamp, sad, temporalMixPrior, thsad, disableMask,
         0, 0, 0,
         globalX, globalY,
-        pel, subpelInterp, mixPlan);
+        fixedLayout ? 1 : pel, subpelInterp, mixPlan);
 }
 
 static RGY_ERR launchNVEncDegrainDegrainOverlapPlaneRampImpl(
@@ -4053,8 +4136,8 @@ static RGY_ERR launchNVEncDegrainDegrainOverlapPlaneRampImpl(
     const int refs, const int pel, const int subpelInterp, cudaStream_t stream) {
     const dim3 block(32, 8);
     const dim3 grid(divCeil(width, (int)block.x), divCeil(height, (int)block.y));
-#define LAUNCH_DEGRAIN_RAMP(TYPE, REFS, USE_PLAN) do { \
-    kernel_degrain_degrain_overlap_plane_ramp_cuda<TYPE, REFS, USE_PLAN><<<grid, block, 0, stream>>>( \
+#define LAUNCH_DEGRAIN_RAMP(TYPE, REFS, USE_PLAN, FIXED_LAYOUT) do { \
+    kernel_degrain_degrain_overlap_plane_ramp_cuda<TYPE, REFS, USE_PLAN, FIXED_LAYOUT><<<grid, block, 0, stream>>>( \
         reinterpret_cast<TYPE *>(dst), dstPitch, \
         cur, curPitch, \
         refBackward1, refForward1, \
@@ -4074,12 +4157,19 @@ static RGY_ERR launchNVEncDegrainDegrainOverlapPlaneRampImpl(
 } while (0)
 #define SWITCH_DEGRAIN_RAMP(TYPE, USE_PLAN) \
     switch (refs) { \
-    case 2: LAUNCH_DEGRAIN_RAMP(TYPE, 2, USE_PLAN); break; \
-    case 4: LAUNCH_DEGRAIN_RAMP(TYPE, 4, USE_PLAN); break; \
-    case 6: LAUNCH_DEGRAIN_RAMP(TYPE, 6, USE_PLAN); break; \
-    case 8: LAUNCH_DEGRAIN_RAMP(TYPE, 8, USE_PLAN); break; \
-    case 10: LAUNCH_DEGRAIN_RAMP(TYPE, 10, USE_PLAN); break; \
+    case 2: LAUNCH_DEGRAIN_RAMP(TYPE, 2, USE_PLAN, false); break; \
+    case 4: LAUNCH_DEGRAIN_RAMP(TYPE, 4, USE_PLAN, false); break; \
+    case 6: LAUNCH_DEGRAIN_RAMP(TYPE, 6, USE_PLAN, false); break; \
+    case 8: LAUNCH_DEGRAIN_RAMP(TYPE, 8, USE_PLAN, false); break; \
+    case 10: LAUNCH_DEGRAIN_RAMP(TYPE, 10, USE_PLAN, false); break; \
     default: return RGY_ERR_UNSUPPORTED; \
+    }
+    // 既定KFMの輝度だけを特殊化し、幾何とpelを定数伝播させる。
+    if (pixelBytes == 1 && refs == 2 && mixPlan && pel == 1
+        && layout.blockSize == 32 && layout.overlap == 16 && layout.step == 16
+        && planeScaleX == 1 && planeScaleY == 1) {
+        LAUNCH_DEGRAIN_RAMP(uint8_t, 2, true, true);
+        return err_to_rgy(cudaGetLastError());
     }
     if (pixelBytes > 1) {
         if (mixPlan) {

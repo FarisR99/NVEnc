@@ -207,6 +207,7 @@ public:
     ~afsStreamStatus();
 
     int open_log(const tstring& log_filename);
+    void set_timebase(const rgy_rational<int>& quarterTimebase, const rgy_rational<int>& timebase);
     void init(uint8_t status, int drop24);
     int set_status(int iframe, uint8_t status, int drop24, int64_t orig_pts);
     int64_t get_duration(int64_t iframe);
@@ -214,6 +215,8 @@ private:
     void write_log(const afsFrameTs *const frameTs);
 
     bool m_initialized;
+    rgy_rational<int> m_quarterTimebase;
+    rgy_rational<int> m_timebase;
     int m_quarter_jitter;
     int m_additional_jitter;
     int m_phase24;
@@ -263,6 +266,8 @@ protected:
     unique_ptr<cudaEvent_t, cudaevent_deleter> m_eventMergeScan;
     int m_nFrame;
     int64_t m_nPts;
+    int64_t m_inputOriginPts;
+    bool m_inputOriginValid;
 
     afsSourceCache  m_source;
     afsScanCache    m_scan;

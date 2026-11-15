@@ -1634,6 +1634,13 @@ protected:
 #else
                 if (m_thDecoder.native_handle() && !RGYThreadStillActive(m_thDecoder.native_handle())) {
 #endif
+                    // 待機中に正常終了した場合も、残った出力とEOFを先に確認する。
+                    // スレッド終了だけを異常扱いすると、最後のフレームを捨ててしまう。
+                    if (!m_dec->frameQueue()->isEmpty()) continue;
+                    if (m_dec->frameQueue()->isEndOfDecode()) {
+                        m_state = RGY_STATE_EOF;
+                        return RGY_ERR_MORE_BITSTREAM;
+                    }
                     PrintMes(RGY_LOG_ERROR, _T("Decode thread is not responding.\n"));
                     m_state = RGY_STATE_ERROR;
                     return RGY_ERR_UNKNOWN;
@@ -2260,6 +2267,11 @@ public:
         }
         m_inFrames++;
         PipelineTaskOutputSurf *taskSurf = dynamic_cast<PipelineTaskOutputSurf *>(frame.get());
+        // --preview-serverの窓の外のフレーム(開始時刻より前で捨てる分、上限を超えた分)は、フィルタへ渡さない。
+        bool keepPreview = true;
+        const auto previewErr = m_input->checkPreviewWindow(taskSurf->surf().frame()->timestamp(), m_srcTimebase, keepPreview);
+        if (previewErr != RGY_ERR_NONE) return previewErr;
+        if (!keepPreview) return RGY_ERR_NONE;
         const auto trimSts = frame_inside_range(taskSurf->surf().frame()->inputFrameId(), m_trimParam.list);
         const auto inputFramePts = rational_rescale(taskSurf->surf().frame()->timestamp(), m_srcTimebase, m_outTimebase);
         if ((trimSts.second > 0) //check_pts内で最初のフレームのptsを0とするようnOutFirstPtsが設定されるので、先頭のtrim blockについてはここでは処理しない
@@ -2371,7 +2383,8 @@ public:
             }
         }
         PrintMes(RGY_LOG_TRACE, _T("check_pts(%d/%d): nOutEstimatedPts %lld, outPtsSource %lld, outDuration %d\n"), taskSurf->surf().frame()->inputFrameId(), m_inFrames, m_tsOutEstimated, outPtsSource, outDuration);
-        if (m_tsOutFirst == INVALID_PTS) {
+        const bool firstInputPts = m_tsOutFirst == INVALID_PTS;
+        if (firstInputPts) {
             m_tsOutFirst = outPtsSource; //最初のpts
             PrintMes(RGY_LOG_DEBUG, _T("check_pts: m_tsOutFirst %lld\n"), outPtsSource);
         }
@@ -2379,6 +2392,10 @@ public:
         if (!m_timestampPassThrough) {
             //最初のptsを0に修正
             outPtsSource -= m_tsOutFirst;
+        }
+        if (firstInputPts && (m_vpp_rff || m_vpp_afs_rff_aware)) {
+            // 初回の入力原点をgapと誤認しないよう、正規化後の入力と同じ時計から推定を始める。
+            m_tsOutEstimated = outPtsSource;
         }
 
         if ((m_avsync & RGY_AVSYNC_VFR) || m_vpp_rff || m_vpp_afs_rff_aware) {
