@@ -46,7 +46,7 @@ class NVEncFilterDegrain;
 
 
 RGY_ERR run_kfm_ucf_preprocess(RGYFrameInfo *dst, const RGYFrameInfo *src, int srcXOffset, int srcYOffset, int srcYStep, int channels,
-    const int *offsetV, const float *coeffV, const int *offsetH, const float *coeffH, int nmin, int range, cudaStream_t stream);
+    const int *offsetV, const float *coeffV, const int *offsetH, const float *coeffH, int nmin, int range, cudaStream_t stream, const RGYFrameInfo *dstPair = nullptr, const RGYFrameInfo *srcPair = nullptr);
 RGY_ERR run_kfm_ucf_analyze_fused(RGYKFM::NoiseResult *dst, int offset, const RGYFrameInfo *n0, const RGYFrameInfo *n1, const RGYFrameInfo *n2,
     const RGYFrameInfo *d0, const RGYFrameInfo *d1, int nw4, int dw4, int dh, int vpad, cudaStream_t stream);
 RGY_ERR run_kfm_ucf_reduce(RGYKFM::NoiseResult *dst, const RGYKFM::NoiseResult *src, int lumaCount, int chromaCount, cudaStream_t stream);
@@ -306,10 +306,11 @@ protected:
     };
     struct KfmContainsCombeReadback {
         uint32_t count;
+        std::shared_ptr<uint32_t> countHost;
         RGYCudaEvent event;
         bool submitted;
 
-        KfmContainsCombeReadback() : count(0), event(), submitted(false) {};
+        KfmContainsCombeReadback() : count(0), countHost(), event(), submitted(false) {};
     };
     struct KfmCachedDeint60 {
         int n60;
@@ -434,12 +435,10 @@ protected:
     RGY_ERR createUcfGaussProgram(KfmUcfGaussProgram& program, int sourceSize, double cropSize, int targetSize, double p);
     RGY_ERR prepareUcfNoiseFieldCropFrame(RGYFrameInfo **ppFieldFrame, int sourceIndex, int parity, const RGYFrameInfo *pInputFrame,
         cudaStream_t stream, const std::vector<RGYCudaEvent> &wait_events, RGYCudaEvent *event);
-    RGY_ERR prepareUcfNoiseGaussFrameFromSource(RGYFrameInfo **ppGaussFrame, int sourceIndex, int parity, const RGYFrameInfo *pInputFrame,
-        cudaStream_t stream, const std::vector<RGYCudaEvent> &wait_events, RGYCudaEvent *event);
+    RGY_ERR runUcfNoisePreprocessFromSource(int sourceIndex, int parity, const RGYFrameInfo *pInputFrame,
+        cudaStream_t stream, const std::vector<RGYCudaEvent> &wait_events);
     RGY_ERR prepareUcfNoiseGaussFrame(RGYFrameInfo **ppGaussFrame, int parity, const RGYFrameInfo *pInputFrame,
         cudaStream_t stream, const std::vector<RGYCudaEvent> &wait_events, RGYCudaEvent *event);
-    RGY_ERR runUcfNoiseLimitStageFromSource(const NVEncFilterParamKfm& prm, const RGYFrameInfo *pSrcFrame, const RGYFrameInfo *pNoiseFrame,
-        int fieldIndex, int parity, cudaStream_t stream, const std::vector<RGYCudaEvent> &wait_events);
     RGY_ERR runUcfNoiseLimitStage(const NVEncFilterParamKfm& prm, const RGYFrameInfo *pSrcFrame, const RGYFrameInfo *pNoiseFrame,
         int fieldIndex, cudaStream_t stream, const std::vector<RGYCudaEvent> &wait_events);
     RGY_ERR analyzeUcfNoiseDebug(cudaStream_t stream);
@@ -574,8 +573,9 @@ protected:
         int64_t timestamp;
         std::shared_ptr<CUFrameBuf> frame;
         RGYCudaEvent event;
+        bool constantNoise; // frameを確保せず、noiseが中間値Nで一定であることを表す。
 
-        KfmCachedUcfNoise() : fieldIndex(-1), inputFrameId(-1), timestamp(0), frame(), event() {};
+        KfmCachedUcfNoise() : fieldIndex(-1), inputFrameId(-1), timestamp(0), frame(), event(), constantNoise(false) {};
     };
 
     struct KfmUcfNoiseDumpRecord {
@@ -810,6 +810,7 @@ protected:
     std::array<std::unique_ptr<CUMemBuf>, 4> m_switchFlagWork;
     RGYCudaEvent m_switchFlagWorkEvent;
     std::unique_ptr<CUMemBuf> m_containsCombeCount;
+    std::vector<std::shared_ptr<uint32_t>> m_containsCombeReadbackPool;
     FILE *m_fpResult;
     FILE *m_fpFMCount;
     FILE *m_fpTimecode;
